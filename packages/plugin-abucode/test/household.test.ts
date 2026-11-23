@@ -10,17 +10,21 @@ import {
 } from "../src/household.js"
 
 describe("Household 343 & Vanilla Mode", () => {
-  test("No Character / Vanilla mode emits empty persona prompt and skips directives", () => {
+  test("No Character / Vanilla mode still injects the LLM directive without Household character cards", () => {
+    const expectedDirective = resolveLlmDirective({
+      model: "gemini-4-argon",
+      provider: "venice",
+    }).trim()
     for (const alias of ["none", "vanilla", "no_character", "no character", "off"]) {
       expect(isNoCharacter(alias)).toBe(true)
       expect(normalizeCharacterChoice(alias)).toBe("none")
-      expect(
-        composeCharacterSystemPrompt({
-          character: alias,
-          model: "gemini-4-argon",
-          provider: "venice",
-        }),
-      ).toBe("")
+      const prompt = composeCharacterSystemPrompt({
+        character: alias,
+        model: "gemini-4-argon",
+        provider: "venice",
+      })
+      expect(prompt).toBe(expectedDirective)
+      expect(prompt).not.toContain("## Household Persona Directives")
     }
     expect(describeCharacterLabel("none")).toBe("No Character (Vanilla)")
   })
