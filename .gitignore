@@ -4,8 +4,8 @@ node_modules
 .sst
 .env
 .env.local
-zzz_local/
-z_local/
+zzz_local
+z_local
 .idea
 .vscode
 .codex

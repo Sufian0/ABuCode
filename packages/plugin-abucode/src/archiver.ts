@@ -168,6 +168,8 @@ export function discoverChatHistoryRoots(
   if (opts?.allowDefaultFallbacks !== false) {
     candidates.push(
       ABUCODE_REPO_ROOT,
+      "D:/Libraries/Documents/1ACode/ABuCode",
+      path.join(os.homedir(), "Documents", "Projects", "ABuCode"),
       "D:/Libraries/Documents/1ACode/MultiCode",
       path.join(os.homedir(), "Documents", "Projects", "MultiCode"),
     )
