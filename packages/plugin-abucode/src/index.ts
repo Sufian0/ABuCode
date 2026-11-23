@@ -3,6 +3,7 @@ import { define } from "@opencode/plugin/effect/plugin"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
 import { ABuCode, type PolicyTier, type SessionSettings } from "@opencode/schema/abucode"
 import { Session } from "@opencode/schema/session"
+import { Tool } from "@opencode/schema/tool"
 import { DateTime, Effect, Option, Schema } from "effect"
 import { archiveSessionToChatHistory, type ArchivableTurn } from "./archiver.js"
 import { resolveContentRoot } from "./content-paths.js"
@@ -12,6 +13,7 @@ import {
   getGeneralCharacters,
   normalizeCharacterChoice,
 } from "./household.js"
+import { PlaytestInput, PlaytestOutput, runPlaytestUrl } from "./playtest.js"
 import {
   applyABuCodeProviderTransform,
   getProviderKeysStatus,
@@ -19,7 +21,16 @@ import {
   saveProviderKeysToEnvLocal,
   testProviderConnection,
 } from "./providers.js"
-import { normalizePolicyTier } from "./security.js"
+import {
+  classifyCatastrophicCommand,
+  commandStagesSecretEnvFile,
+  evaluateShellPolicyDecision,
+  normalizePolicyTier,
+  redactKnownSecrets,
+  scrubEnvironmentInPlace,
+  secretFileAccessReason,
+  validateFetchUrlGuard,
+} from "./security.js"
 import { isCustomPoeBot, sanitizePoeRequestBodyJson, wrapResilientLanguageModel } from "./stream-bridge.js"
 
 const decodeString = Schema.decodeUnknownOption(Schema.String)
@@ -273,8 +284,121 @@ export default define({
       }).pipe(Effect.catchCause(() => Effect.succeed([] as string[])))
 
     yield* ctx.session.hook("experimental.idle", (event) =>
-      archiveLiveSession(event.sessionID).pipe(Effect.asVoid),
+      Effect.gen(function* () {
+        sessionToolRounds.delete(event.sessionID)
+        sessionToolCeiling.delete(event.sessionID)
+        yield* archiveLiveSession(event.sessionID)
+      }),
     )
+
+    // --- Phase 4: Security Bodyguards (Shell Env Scrubber, 4-Tier Policy, Secret & SSRF Guards, Tool-Round Limit) ---
+    const sessionToolRounds = new Map<string, number>()
+    const sessionToolCeiling = new Map<string, number>()
+    const DEFAULT_TOOL_ROUND_CEILING = 40
+    const EXTRA_TOOL_ROUNDS_STEP = 10
+
+    yield* ctx.shell.hook("create.before", (event) =>
+      Effect.sync(() => {
+        scrubEnvironmentInPlace(event.env)
+        const catastrophic = classifyCatastrophicCommand(event.command)
+        if (catastrophic) throw new Error(catastrophic)
+        const stagedEnv = commandStagesSecretEnvFile(event.command)
+        if (stagedEnv) throw new Error(stagedEnv)
+      }),
+    )
+
+    yield* ctx.permission.hook("evaluate", (event) =>
+      Effect.gen(function* () {
+        if (event.action !== "shell") return
+        const settings = yield* buildSessionSettings(event.sessionID)
+        const combined = event.resources.join("\n")
+        const decision = evaluateShellPolicyDecision(settings.policy, combined, event.effect)
+        event.effect = decision.effect
+        if (decision.message) event.message = decision.message
+      }).pipe(Effect.catchCause(() => Effect.void)),
+    )
+
+    yield* ctx.tool.hook("execute.before", (event) =>
+      Effect.gen(function* () {
+        const inputObj =
+          typeof event.input === "object" && event.input !== null
+            ? (event.input as Record<string, unknown>)
+            : {}
+
+        // 1. Protect .env* / credential config files from read/write/edit/grep/patch
+        if (["read", "write", "edit", "patch"].includes(event.tool)) {
+          for (const field of ["filePath", "path", "target"]) {
+            const val = inputObj[field]
+            if (typeof val === "string" && val.trim()) {
+              const reason = secretFileAccessReason(val.trim())
+              if (reason) return yield* Effect.fail(new Tool.Error({ message: reason }))
+            }
+          }
+        }
+
+        // 2. SSRF / Private LAN / Tailscale guard on webfetch
+        if (event.tool === "webfetch" && typeof inputObj.url === "string") {
+          const blockReason = validateFetchUrlGuard(inputObj.url, { allowLoopbackGet: true })
+          if (blockReason) return yield* Effect.fail(new Tool.Error({ message: blockReason }))
+        }
+
+        // 3. Tool-round limit pause gate (+10 extra rounds confirmation)
+        const nextCount = (sessionToolRounds.get(event.sessionID) ?? 0) + 1
+        sessionToolRounds.set(event.sessionID, nextCount)
+        const ceiling = sessionToolCeiling.get(event.sessionID) ?? DEFAULT_TOOL_ROUND_CEILING
+        if (nextCount > ceiling) {
+          yield* ctx.permission.assert({
+            action: "tool-round-limit",
+            resources: [
+              `Reached ${ceiling} tool calls in this turn — allow +${EXTRA_TOOL_ROUNDS_STEP} more rounds?`,
+            ],
+            sessionID: event.sessionID,
+            agent: event.agent,
+            source: { type: "tool", messageID: event.messageID, id: event.id },
+          })
+          sessionToolCeiling.set(event.sessionID, ceiling + EXTRA_TOOL_ROUNDS_STEP)
+        }
+      }),
+    )
+
+    yield* ctx.tool.hook("execute.after", (event) =>
+      Effect.sync(() => {
+        if (event.status !== "completed") return
+        const content = event.result.content
+        if (typeof content === "string") {
+          event.result = { ...event.result, content: redactKnownSecrets(content) }
+          return
+        }
+        if (Array.isArray(content)) {
+          event.result = {
+            ...event.result,
+            content: content.map((part) =>
+              part.type === "text" ? { ...part, text: redactKnownSecrets(part.text) } : part,
+            ),
+          }
+        }
+      }),
+    )
+
+    yield* ctx.tool.transform((tools) => {
+      tools.add({
+        name: "playtest_url",
+        description:
+          "Launch headless Chromium/Edge/Chrome via Playwright against a local loopback server (localhost / 127.0.0.1), optionally starting start_command under a scrubbed environment, running interactive UI steps/assertions, capturing JS console & HTTP errors, and returning live vision screenshots.",
+        input: PlaytestInput,
+        output: PlaytestOutput,
+        options: { codemode: false, permission: "playtest_url" },
+        execute: (input) =>
+          Effect.tryPromise({
+            try: () => runPlaytestUrl(input),
+            catch: (cause) =>
+              new Tool.Error({
+                message: cause instanceof Error ? cause.message : String(cause),
+                error: cause,
+              }),
+          }),
+      })
+    })
 
     yield* ctx.command.transform((editor) => {
       editor.add({
@@ -422,6 +546,41 @@ export default define({
               text: `Archived session Markdown to:\n${written.map((p) => `- \`${p}\``).join("\n")}`,
               description: `Archived to Chat-History (${written.length} target${written.length === 1 ? "" : "s"})`,
               metadata: { source: "abucode.archive" },
+              delivery: input.delivery,
+            })
+          }).pipe(Effect.asVoid),
+      })
+
+      editor.add({
+        name: "policy",
+        description: "switch command approval policy (/policy [request_review | default | auto | turbo])",
+        execute: (input) =>
+          Effect.gen(function* () {
+            const raw = input.prompt.text.trim().toLowerCase()
+            const current = yield* buildSessionSettings(input.sessionID)
+            if (!raw) {
+              return yield* Effect.fail(
+                new Error(
+                  `Active approval policy: ${current.policy}\nUsage: /policy <request_review | default | auto | turbo>`,
+                ),
+              )
+            }
+            if (!["request_review", "review", "default", "auto", "turbo"].includes(raw)) {
+              return yield* Effect.fail(
+                new Error("Invalid policy. Choose one of: request_review, default, auto, turbo"),
+              )
+            }
+            const tier = normalizePolicyTier(raw)
+            yield* writeStr(sessionPolicyKey(input.sessionID), tier)
+            yield* writeStr(KEY_DEFAULT_POLICY, tier)
+            const next = yield* buildSessionSettings(input.sessionID)
+            const defaultPolicy = yield* getDefaultPolicy()
+            yield* emitChanged({ sessionID: input.sessionID, settings: next, defaultPolicy })
+            yield* ctx.session.synthetic({
+              sessionID: input.sessionID,
+              text: `Switched command approval policy to **${tier}**.`,
+              description: `Approval policy -> ${tier}`,
+              metadata: { source: "abucode.policy", policy: tier },
               delivery: input.delivery,
             })
           }).pipe(Effect.asVoid),
