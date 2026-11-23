@@ -18,6 +18,12 @@ const dict = {
   policyDefault: "Default — Ask before deletes, git push, installs & servers",
   policyAuto: "Auto — Run routine dev commands; ask before deletes, push, sudo & secrets",
   policyTurbo: "Turbo — Run commands automatically (disk wipe & fork bombs stay blocked)",
+  settingsTitle: "ABuCode",
+  keysHeading: "Provider API Keys (.env.local)",
+  keysSub: "Keys are stored strictly in gitignored .env.local. Leave blank to keep existing key.",
+  saveKeysBtn: "Save Keys",
+  testBtn: "Test Connection",
+  keysSaved: "Saved provider keys to .env.local",
   requestFailed: "ABuCode update failed",
 } as const
 

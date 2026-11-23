@@ -3,11 +3,18 @@ import { createStore } from "solid-js/store"
 import {
   ComposerPill,
   createKeyed,
+  SettingsPage,
   type ComposerPillMenuProps,
   type ComposerPillProps,
   type Plugin,
 } from "@opencode/plugin/gui"
-import { ABuCode, type CharacterEntry, type PolicyTier, type SessionSettings } from "@opencode/schema/abucode"
+import {
+  ABuCode,
+  type CharacterEntry,
+  type PolicyTier,
+  type ProviderKeyInfo,
+  type SessionSettings,
+} from "@opencode/schema/abucode"
 import { Button } from "@opencode/ui/button"
 import { showToast } from "@opencode/ui/toast"
 import type ABuCodeDefinition from "./index"
@@ -310,6 +317,109 @@ const setup: Plugin.Setup<typeof ABuCodeDefinition> = (ctx) => {
           },
         ],
       }
+    },
+  })
+
+  // 4. ABuCode Settings Page (.env.local Provider Vault & Connection Latency Tester)
+  ctx.add(SettingsPage, {
+    id: "abucode",
+    get title() {
+      return ctx.t("settingsTitle")
+    },
+    icon: "models",
+    render: () => {
+      const [keyStatuses, setKeyStatuses] = createSignal<readonly ProviderKeyInfo[]>([])
+      const [draftKeys, setDraftKeys] = createStore<Record<string, string>>({})
+      const [testOutput, setTestOutput] = createSignal("")
+
+      const activeServer = () => ctx.sessions.current()?.server
+      createKeyed(
+        () => activeServer()?.connected ? activeServer()?.id : undefined,
+        () => {
+          const srv = activeServer()
+          if (!srv) return
+          void srv.client
+            .rpc(ABuCode.Definition)
+            .getKeys({})
+            .then((rows) => setKeyStatuses(rows), () => undefined)
+        },
+      )
+
+      const onSaveKeys = () => {
+        const srv = activeServer()
+        if (!srv) return
+        void srv.client
+          .rpc(ABuCode.Definition)
+          .saveKeys({ keys: { ...draftKeys } })
+          .then((rows) => {
+            setKeyStatuses(rows)
+            setDraftKeys({ venice: "", "nano-gpt": "", poe: "", runpod: "" })
+            showToast({ variant: "success", title: ctx.t("keysSaved") })
+          })
+          .catch(reportError)
+      }
+
+      const onTestProvider = (providerID: string) => {
+        const srv = activeServer()
+        if (!srv) return
+        setTestOutput(`Testing ${providerID}...`)
+        void srv.client
+          .rpc(ABuCode.Definition)
+          .testProvider({ provider: providerID })
+          .then((res) => {
+            setTestOutput(res.ok ? `✓ ${res.message ?? providerID}` : `✗ ${res.error ?? "Failed"}`)
+          })
+          .catch((err: unknown) => {
+            setTestOutput(`✗ ${err instanceof Error ? err.message : String(err)}`)
+          })
+      }
+
+      return (
+        <div class="flex flex-col gap-4 p-4 max-w-[680px]">
+          <div class="flex flex-col gap-1">
+            <h3 class="text-[14px] font-semibold text-v2-text-primary">{ctx.t("keysHeading")}</h3>
+            <p class="text-[12px] text-v2-text-secondary">{ctx.t("keysSub")}</p>
+          </div>
+
+          <div class="flex flex-col gap-3 rounded-lg border border-v2-border-subtle p-3">
+            <For each={keyStatuses()}>
+              {(prov) => (
+                <div class="flex flex-col gap-1">
+                  <div class="flex items-center justify-between text-[12px]">
+                    <span class="font-medium text-v2-text-primary">
+                      {prov.name} ({prov.envKey})
+                    </span>
+                    <div class="flex items-center gap-2">
+                      <span class="text-v2-text-secondary">
+                        {prov.hasKey ? `Ready (${prov.maskedKey})` : "Not configured"}
+                      </span>
+                      <Show when={prov.id !== "runpod"}>
+                        <Button size="small" variant="ghost" onClick={() => onTestProvider(prov.id)}>
+                          {ctx.t("testBtn")}
+                        </Button>
+                      </Show>
+                    </div>
+                  </div>
+                  <input
+                    type="password"
+                    value={draftKeys[prov.id] ?? ""}
+                    onInput={(e) => setDraftKeys(prov.id, e.currentTarget.value)}
+                    placeholder={`Enter new ${prov.name} API key or leave blank`}
+                    class="w-full rounded px-2.5 py-1.5 text-[12px] bg-v2-background-bg-base border border-v2-border-subtle text-v2-text-primary outline-none"
+                  />
+                </div>
+              )}
+            </For>
+
+            <div class="flex items-center justify-between pt-2">
+              <span class="text-[12px] text-v2-text-secondary">{testOutput()}</span>
+              <Button size="small" variant="submit" onClick={onSaveKeys}>
+                {ctx.t("saveKeysBtn")}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )
     },
   })
 }

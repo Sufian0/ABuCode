@@ -11,12 +11,14 @@ import {
   normalizeCharacterChoice,
 } from "./household.js"
 import {
+  applyABuCodeProviderTransform,
   getProviderKeysStatus,
   loadResolvedSecretEnv,
   saveProviderKeysToEnvLocal,
   testProviderConnection,
 } from "./providers.js"
 import { normalizePolicyTier } from "./security.js"
+import { isCustomPoeBot, sanitizePoeRequestBodyJson, wrapResilientLanguageModel } from "./stream-bridge.js"
 
 const decodeString = Schema.decodeUnknownOption(Schema.String)
 
@@ -49,6 +51,42 @@ export default define({
   id: "abucode.core",
   effect: Effect.fn("ABuCodePlugin")(function* (ctx) {
     loadResolvedSecretEnv()
+
+    yield* ctx.provider.transform(applyABuCodeProviderTransform)
+
+    yield* ctx.aisdk.hook("sdk", (event) =>
+      Effect.sync(() => {
+        const modelID = String(event.model.modelID || event.model.id)
+        const providerID = String(event.model.providerID)
+        if (!isCustomPoeBot(providerID, modelID)) return
+        const baseFetch: typeof fetch = typeof event.options.fetch === "function" ? event.options.fetch : fetch
+        event.options.fetch = (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          if (init && typeof init.body === "string") {
+            return baseFetch(input, {
+              ...init,
+              body: sanitizePoeRequestBodyJson(init.body, providerID, modelID),
+            })
+          }
+          return baseFetch(input, init)
+        }
+      }),
+    )
+
+    yield* ctx.aisdk.hook("language", (event) =>
+      Effect.sync(() => {
+        const providerID = String(event.model.providerID)
+        const modelID = String(event.model.modelID || event.model.id)
+        const rawLang =
+          event.language ??
+          (typeof event.sdk?.languageModel === "function" ? event.sdk.languageModel(modelID) : undefined)
+        if (!rawLang) return
+        event.language = wrapResilientLanguageModel(rawLang, {
+          providerID,
+          modelID,
+          forceXmlTools: isCustomPoeBot(providerID, modelID) || !event.model.capabilities.tools,
+        })
+      }),
+    )
 
     let emitChanged: (payload: ChangedPayload) => Effect.Effect<void> = () => Effect.void
 
@@ -137,7 +175,12 @@ export default define({
             return next
           }),
         getKeys: () => Effect.sync(() => getProviderKeysStatus()),
-        saveKeys: (input) => Effect.sync(() => saveProviderKeysToEnvLocal(input.keys)),
+        saveKeys: (input) =>
+          Effect.gen(function* () {
+            const updated = saveProviderKeysToEnvLocal(input.keys)
+            yield* ctx.provider.reload().pipe(Effect.catchCause(() => Effect.void))
+            return updated
+          }),
         testProvider: (input) =>
           Effect.promise(() =>
             testProviderConnection({
@@ -224,6 +267,42 @@ export default define({
               metadata: { source: "abucode.character", character: next.character },
               delivery: input.delivery,
             })
+          }).pipe(Effect.asVoid),
+      })
+
+      editor.add({
+        name: "keys",
+        description: "view .env.local provider key status or run latency test (/keys [status | test venice|nano-gpt|poe])",
+        execute: (input) =>
+          Effect.gen(function* () {
+            const raw = input.prompt.text.trim().toLowerCase()
+            if (!raw || raw === "status") {
+              const statuses = getProviderKeysStatus()
+              const lines = statuses.map(
+                (k) => `  ${k.name} (${k.envKey}): ${k.hasKey ? `Ready (${k.maskedKey})` : "Not set"}`,
+              )
+              return yield* Effect.fail(
+                new Error(
+                  `ABuCode .env.local Provider Keys:\n${lines.join("\n")}\n\nRun '/keys test venice' (or nano-gpt / poe) to test connectivity, or configure keys in Settings -> ABuCode.`,
+                ),
+              )
+            }
+            if (raw.startsWith("test ")) {
+              const target = raw.slice(5).trim()
+              const res = yield* Effect.promise(() => testProviderConnection({ provider: target }))
+              if (!res.ok) {
+                return yield* Effect.fail(new Error(`${target} connection failed: ${res.error ?? "Unknown error"}`))
+              }
+              yield* ctx.session.synthetic({
+                sessionID: input.sessionID,
+                text: `Provider **${res.provider}** test succeeded: ${res.message ?? "OK"}`,
+                description: `Provider test (${res.provider}): ${res.message ?? "OK"}`,
+                metadata: { source: "abucode.keys" },
+                delivery: input.delivery,
+              })
+              return
+            }
+            return yield* Effect.fail(new Error("Usage: /keys [status | test venice | test nano-gpt | test poe]"))
           }).pipe(Effect.asVoid),
       })
     })

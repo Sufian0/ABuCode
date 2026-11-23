@@ -544,6 +544,7 @@
       "name": "@opencode/plugin-abucode",
       "version": "2.2.5",
       "dependencies": {
+        "@ai-sdk/provider": "3.0.19",
         "@opencode/ai": "workspace:*",
         "@opencode/plugin": "workspace:*",
         "@opencode/schema": "workspace:*",

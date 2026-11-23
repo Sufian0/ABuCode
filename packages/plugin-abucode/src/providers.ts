@@ -1,14 +1,20 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import type { ProviderEditor } from "@opencode/plugin/effect/provider"
 import type { ConnectionTestResult, ProviderKeyInfo } from "@opencode/schema/abucode"
+import { Model } from "@opencode/schema/model"
+import { Money } from "@opencode/schema/money"
+import { Provider } from "@opencode/schema/provider"
 import { ABUCODE_ENV_LOCAL } from "./content-paths.js"
+import { CUSTOM_POE_BOTS } from "./stream-bridge.js"
 
 export interface ProviderMeta {
   readonly id: string
   readonly name: string
   readonly envKey: string
   readonly baseUrl: string
+  readonly apiRoot: string
   readonly defaultModel: string
 }
 
@@ -18,6 +24,7 @@ export const PROVIDERS_META: readonly ProviderMeta[] = [
     name: "Venice",
     envKey: "VENICE_API_KEY",
     baseUrl: "https://api.venice.ai/api/v1/chat/completions",
+    apiRoot: "https://api.venice.ai/api/v1",
     defaultModel: "gemini-4-argon",
   },
   {
@@ -25,6 +32,7 @@ export const PROVIDERS_META: readonly ProviderMeta[] = [
     name: "NanoGPT",
     envKey: "NANO_GPT_API_KEY",
     baseUrl: "https://api.nano-gpt.com/api/v1/chat/completions",
+    apiRoot: "https://api.nano-gpt.com/api/v1",
     defaultModel: "google/gemini-4-argon",
   },
   {
@@ -32,6 +40,7 @@ export const PROVIDERS_META: readonly ProviderMeta[] = [
     name: "Poe",
     envKey: "POE_API_KEY",
     baseUrl: "https://api.poe.com/v1/chat/completions",
+    apiRoot: "https://api.poe.com/v1",
     defaultModel: "google/gemini-3.8-flash",
   },
   {
@@ -39,9 +48,147 @@ export const PROVIDERS_META: readonly ProviderMeta[] = [
     name: "RunPod",
     envKey: "RUNPOD_API_KEY",
     baseUrl: "https://api.runpod.ai/v2",
+    apiRoot: "https://api.runpod.ai/v2",
     defaultModel: "meta-llama/Llama-3.3-70B-Instruct",
   },
 ]
+
+interface SupplementalSpec {
+  readonly id: string
+  readonly name: string
+  readonly family: string
+  readonly tools: boolean
+  readonly efforts: readonly string[]
+  readonly costIn?: number
+  readonly costOut?: number
+}
+
+const SUPPLEMENTAL_MODELS: Readonly<Record<string, readonly SupplementalSpec[]>> = {
+  venice: [
+    {
+      id: "gemini-4-carbon",
+      name: "★ Gemini 4 Carbon",
+      family: "gemini",
+      tools: true,
+      efforts: ["low", "medium", "high"],
+      costIn: 2.5,
+      costOut: 12.5,
+    },
+    {
+      id: "gemini-4-argon",
+      name: "★ Gemini 4 Argon",
+      family: "gemini",
+      tools: true,
+      efforts: ["low", "medium", "high"],
+      costIn: 2.5,
+      costOut: 12.5,
+    },
+    {
+      id: "claude-fable-5-2",
+      name: "★ Claude Fable 5.2",
+      family: "claude-fable",
+      tools: true,
+      efforts: ["low", "medium", "high", "xhigh", "max"],
+      costIn: 8,
+      costOut: 40,
+    },
+    {
+      id: "claude-opus-5-5",
+      name: "★ Claude Opus 5.5",
+      family: "claude-opus",
+      tools: true,
+      efforts: ["low", "medium", "high", "xhigh", "max"],
+      costIn: 4,
+      costOut: 20,
+    },
+    {
+      id: "openai-gpt-61-sol",
+      name: "★ GPT 6.1 Sol",
+      family: "gpt",
+      tools: true,
+      efforts: ["low", "medium", "high", "xhigh"],
+      costIn: 2,
+      costOut: 10,
+    },
+  ],
+  "nano-gpt": [
+    {
+      id: "google/gemini-4-carbon",
+      name: "★ Gemini 4 Carbon",
+      family: "gemini",
+      tools: true,
+      efforts: ["low", "medium", "high"],
+      costIn: 2,
+      costOut: 10,
+    },
+    {
+      id: "google/gemini-4-argon",
+      name: "★ Gemini 4 Argon",
+      family: "gemini",
+      tools: true,
+      efforts: ["low", "medium", "high"],
+      costIn: 2,
+      costOut: 10,
+    },
+    {
+      id: "anthropic/claude-fable-5.2",
+      name: "★ Claude Fable 5.2",
+      family: "claude-fable",
+      tools: true,
+      efforts: ["low", "medium", "high", "xhigh", "max"],
+      costIn: 10,
+      costOut: 50,
+    },
+    {
+      id: "anthropic/claude-opus-5.5",
+      name: "★ Claude Opus 5.5",
+      family: "claude-opus",
+      tools: true,
+      efforts: ["low", "medium", "high", "xhigh", "max"],
+      costIn: 4,
+      costOut: 20,
+    },
+    {
+      id: "openai/gpt-6.1-sol",
+      name: "★ GPT 6.1 Sol",
+      family: "gpt",
+      tools: true,
+      efforts: ["low", "medium", "high", "xhigh"],
+      costIn: 2,
+      costOut: 10,
+    },
+  ],
+  poe: [
+    {
+      id: "CArgon-4",
+      name: "★ Gemini 4 Argon (Poe Bot)",
+      family: "gemini",
+      tools: true,
+      efforts: [],
+    },
+    {
+      id: "CArgon-4T",
+      name: "★ Gemini 4 Argon Thinking (Poe Bot)",
+      family: "gemini-thinking",
+      tools: true,
+      efforts: [],
+    },
+    {
+      id: "CFable-51",
+      name: "★ Claude Fable 5.1 (Poe Bot)",
+      family: "claude",
+      tools: true,
+      efforts: [],
+    },
+    {
+      id: "CFable-51T",
+      name: "★ Claude Fable 5.1 Thinking (Poe Bot)",
+      family: "claude-thinking",
+      tools: true,
+      efforts: [],
+    },
+  ],
+}
 
 function parseEnvFile(filePath: string): Record<string, string> {
   try {
@@ -170,7 +317,91 @@ export function saveProviderKeysToEnvLocal(
   return getProviderKeysStatus(envLocalPath)
 }
 
-const CUSTOM_POE_BOTS = new Set(["CArgon-4", "CArgon-4T", "CFable-51", "CFable-51T"])
+function buildSupplementalModelInfo(providerID: Provider.ID, spec: SupplementalSpec): Model.Info {
+  const base = Model.Info.default(providerID, Model.ID.make(spec.id))
+  const variants: Model.Variant[] = spec.efforts.map((effort) => ({
+    id: Model.VariantID.make(effort),
+    body: { reasoning_effort: effort },
+  }))
+  const cost: Model.Cost[] =
+    spec.costIn !== undefined && spec.costOut !== undefined
+      ? [
+          {
+            input: Money.USDPerMillionTokens.make(spec.costIn),
+            output: Money.USDPerMillionTokens.make(spec.costOut),
+            cache: {
+              read: Money.USDPerMillionTokens.make(0),
+              write: Money.USDPerMillionTokens.make(0),
+            },
+          },
+        ]
+      : []
+
+  return {
+    ...base,
+    name: spec.name,
+    family: Model.Family.make(spec.family),
+    capabilities: {
+      tools: spec.tools,
+      input: ["text", "image"],
+      output: ["text"],
+    },
+    variants,
+    cost,
+  }
+}
+
+export function applyABuCodeProviderTransform(editor: ProviderEditor): void {
+  const secrets = loadResolvedSecretEnv()
+
+  for (const meta of PROVIDERS_META) {
+    if (meta.id === "runpod") continue
+    const pid = Provider.ID.make(meta.id)
+    const apiKey = secrets[meta.envKey]?.trim() ?? ""
+    const existing = editor.get(meta.id)
+    const specs = SUPPLEMENTAL_MODELS[meta.id] ?? []
+
+    if (!existing) {
+      editor.add({
+        info: {
+          id: pid,
+          name: meta.name,
+          activation: apiKey ? "enabled" : "auto",
+          package: "@ai-sdk/openai-compatible",
+          settings: {
+            baseURL: meta.apiRoot,
+            ...(apiKey ? { apiKey } : {}),
+          },
+        },
+        models: specs.map((spec) => buildSupplementalModelInfo(pid, spec)),
+      })
+      continue
+    }
+
+    if (apiKey) {
+      editor.update(meta.id, (prov) => {
+        prov.activation = "enabled"
+        prov.settings = {
+          ...(prov.settings ?? {}),
+          baseURL: (prov.settings as Record<string, unknown> | undefined)?.baseURL ?? meta.apiRoot,
+          apiKey: (prov.settings as Record<string, unknown> | undefined)?.apiKey || apiKey,
+        }
+      })
+    }
+
+    const currentModels = new Map(existing.models)
+    let added = false
+    for (const spec of specs) {
+      if (!currentModels.has(spec.id)) {
+        currentModels.set(spec.id, buildSupplementalModelInfo(pid, spec))
+        added = true
+      }
+    }
+    if (added) {
+      editor.models.set(meta.id, Array.from(currentModels.values()))
+    }
+  }
+}
 
 export async function testProviderConnection(input: {
   readonly provider: string
