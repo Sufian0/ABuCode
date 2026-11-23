@@ -116,7 +116,8 @@ const prepare = Effect.fn("BackgroundService.prepare")(function* (mode: Backgrou
     : process.env.OPENCODE_DESKTOP_SERVER_CHANNEL === "local"
       ? path.join(
           process.env.XDG_STATE_HOME ?? path.join(app.getPath("home"), ".local", "state"),
-          "opencode",
+          // ABuCode: the CLI registers under the renamed state folder (packages/util/src/global.ts).
+          "abucode",
           "service-local.json",
         )
       : undefined
