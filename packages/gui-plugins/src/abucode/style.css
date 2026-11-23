@@ -1,0 +1,29 @@
+:root[data-abucode-bubbles="active"] [data-component="user-message"] [data-slot="user-message-text"] {
+  background-color: var(--abucode-prompt-bg) !important;
+  color: var(--abucode-prompt-fg, #ffffff) !important;
+}
+
+:root[data-abucode-bubbles="active"] [data-component="assistant-message"] [data-component="text-part"] {
+  background-color: var(--abucode-response-bg);
+  color: var(--abucode-response-fg, inherit);
+  padding: 10px 14px;
+  border-radius: 10px;
+}
+
+:root[data-abucode-bubbles="active"] [data-component="reasoning-part"] {
+  background-color: var(--abucode-thinking-bg);
+  padding: 6px 10px;
+  border-radius: 8px;
+}
+
+:root[data-abucode-width="narrow"] .md\:max-w-session {
+  max-width: 42rem !important;
+}
+
+:root[data-abucode-width="wide"] .md\:max-w-session {
+  max-width: 68rem !important;
+}
+
+:root[data-abucode-width="fill"] .md\:max-w-session {
+  max-width: 96% !important;
+}

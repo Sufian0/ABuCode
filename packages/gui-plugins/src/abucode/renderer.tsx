@@ -4,6 +4,7 @@ import {
   ComposerPill,
   createKeyed,
   SettingsPage,
+  Style,
   type ComposerPillMenuProps,
   type ComposerPillProps,
   type Plugin,
@@ -17,7 +18,10 @@ import {
 } from "@opencode/schema/abucode"
 import { Button } from "@opencode/ui/button"
 import { showToast } from "@opencode/ui/toast"
+import { DesktopSummon, type HotkeyPreset, type SummonState } from "./contract"
 import type ABuCodeDefinition from "./index"
+import type { BubblePreset, ChatWidth } from "./index"
+import styleCss from "./style.css?inline"
 
 const POLICY_LABELS: Record<PolicyTier, string> = {
   request_review: "Review",
@@ -26,7 +30,72 @@ const POLICY_LABELS: Record<PolicyTier, string> = {
   turbo: "Turbo",
 }
 
+const BUBBLE_PRESETS: Record<
+  Exclude<BubblePreset, "theme" | "custom">,
+  { promptBg: string; responseBg: string; thinkingBg: string }
+> = {
+  multicode: { promptBg: "#8B5A3C", responseBg: "#E8E0D0", thinkingBg: "#EFE7DA" },
+  "poe-indigo": { promptBg: "#5B4CE6", responseBg: "#F3F4F6", thinkingBg: "#EDE9FE" },
+  "antigravity-blue": { promptBg: "#2563EB", responseBg: "#F8FAFC", thinkingBg: "#EFF6FF" },
+}
+
+const HOTKEY_OPTIONS: readonly { value: HotkeyPreset; label: string }[] = [
+  { value: "Alt+Space", label: "Alt+Space (Default)" },
+  { value: "CommandOrControl+Shift+Space", label: "Ctrl/Cmd+Shift+Space" },
+  { value: "CommandOrControl+Alt+M", label: "Ctrl/Cmd+Alt+M" },
+  { value: "Alt+Shift+M", label: "Alt+Shift+M" },
+  { value: "None", label: "None (Disabled)" },
+]
+
+function contrastTextForHex(hex: string): string {
+  const clean = hex.replace("#", "")
+  if (clean.length !== 6) return "#ffffff"
+  const r = Number.parseInt(clean.slice(0, 2), 16)
+  const g = Number.parseInt(clean.slice(2, 4), 16)
+  const b = Number.parseInt(clean.slice(4, 6), 16)
+  const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+  return lum > 0.62 ? "#1f1d1a" : "#ffffff"
+}
+
 const setup: Plugin.Setup<typeof ABuCodeDefinition> = (ctx) => {
+  ctx.add(Style, styleCss)
+
+  const appearance = ctx.stores.appearance
+
+  // Sync bubble custom properties and conversation width attributes onto :root.
+  createKeyed(
+    () => {
+      const v = appearance.value
+      return `${v.preset}|${v.promptBg}|${v.responseBg}|${v.thinkingBg}|${v.width}`
+    },
+    () => {
+      if (typeof document === "undefined") return
+      const root = document.documentElement
+      const v = appearance.value
+      if (v.preset === "theme") {
+        root.removeAttribute("data-abucode-bubbles")
+      } else {
+        root.setAttribute("data-abucode-bubbles", "active")
+        root.style.setProperty("--abucode-prompt-bg", v.promptBg)
+        root.style.setProperty("--abucode-prompt-fg", contrastTextForHex(v.promptBg))
+        root.style.setProperty("--abucode-response-bg", v.responseBg)
+        root.style.setProperty("--abucode-response-fg", contrastTextForHex(v.responseBg))
+        root.style.setProperty("--abucode-thinking-bg", v.thinkingBg)
+      }
+      if (v.width === "default") {
+        root.removeAttribute("data-abucode-width")
+      } else {
+        root.setAttribute("data-abucode-width", v.width)
+      }
+    },
+  )
+
+  onCleanup(() => {
+    if (typeof document === "undefined") return
+    document.documentElement.removeAttribute("data-abucode-bubbles")
+    document.documentElement.removeAttribute("data-abucode-width")
+  })
+
   const [sessions, setSessions] = createStore<Record<string, SessionSettings | undefined>>({})
   const [catalogByServer, setCatalogByServer] = createStore<
     Record<string, { characters: readonly CharacterEntry[]; wildcards: readonly CharacterEntry[] } | undefined>
@@ -320,7 +389,7 @@ const setup: Plugin.Setup<typeof ABuCodeDefinition> = (ctx) => {
     },
   })
 
-  // 4. ABuCode Settings Page (.env.local Provider Vault & Connection Latency Tester)
+  // 4. ABuCode Settings Page (.env.local Vault, Bubble Color Pickers, Width Presets & Desktop Summon)
   ctx.add(SettingsPage, {
     id: "abucode",
     get title() {
@@ -331,10 +400,13 @@ const setup: Plugin.Setup<typeof ABuCodeDefinition> = (ctx) => {
       const [keyStatuses, setKeyStatuses] = createSignal<readonly ProviderKeyInfo[]>([])
       const [draftKeys, setDraftKeys] = createStore<Record<string, string>>({})
       const [testOutput, setTestOutput] = createSignal("")
+      const [summonState, setSummonState] = createSignal<SummonState | undefined>(undefined)
+
+      const summonIpc = ctx.app.platform === "desktop" ? ctx.main(DesktopSummon) : undefined
 
       const activeServer = () => ctx.sessions.current()?.server
       createKeyed(
-        () => activeServer()?.connected ? activeServer()?.id : undefined,
+        () => (activeServer()?.connected ? activeServer()?.id : undefined),
         () => {
           const srv = activeServer()
           if (!srv) return
@@ -342,6 +414,20 @@ const setup: Plugin.Setup<typeof ABuCodeDefinition> = (ctx) => {
             .rpc(ABuCode.Definition)
             .getKeys({})
             .then((rows) => setKeyStatuses(rows), () => undefined)
+        },
+      )
+
+      // Load Desktop Summon IPC state when running inside the Electron shell.
+      createKeyed(
+        () => (summonIpc ? "desktop" : undefined),
+        () => {
+          if (!summonIpc) return
+          void summonIpc.getState({ signal: ctx.signal }).then(
+            (st) => {
+              if (!ctx.signal.aborted) setSummonState(st)
+            },
+            () => undefined,
+          )
         },
       )
 
@@ -374,50 +460,259 @@ const setup: Plugin.Setup<typeof ABuCodeDefinition> = (ctx) => {
           })
       }
 
+      const applyPreset = (preset: BubblePreset) => {
+        if (preset === "theme" || preset === "custom") {
+          appearance.update((draft) => {
+            draft.preset = preset
+          })
+          return
+        }
+        const colors = BUBBLE_PRESETS[preset]
+        appearance.update((draft) => {
+          draft.preset = preset
+          draft.promptBg = colors.promptBg
+          draft.responseBg = colors.responseBg
+          draft.thinkingBg = colors.thinkingBg
+        })
+      }
+
+      const setCustomColor = (field: "promptBg" | "responseBg" | "thinkingBg", hex: string) => {
+        if (!/^#[0-9A-Fa-f]{6}$/.test(hex)) return
+        appearance.update((draft) => {
+          draft.preset = "custom"
+          draft[field] = hex
+        })
+      }
+
+      const setWidth = (width: ChatWidth) => {
+        appearance.update((draft) => {
+          draft.width = width
+        })
+      }
+
       return (
-        <div class="flex flex-col gap-4 p-4 max-w-[680px]">
-          <div class="flex flex-col gap-1">
-            <h3 class="text-[14px] font-semibold text-v2-text-primary">{ctx.t("keysHeading")}</h3>
-            <p class="text-[12px] text-v2-text-secondary">{ctx.t("keysSub")}</p>
-          </div>
+        <div class="flex flex-col gap-6 p-4 max-w-[700px]">
+          {/* Section 1: Provider API Keys */}
+          <div class="flex flex-col gap-2">
+            <div class="flex flex-col gap-0.5">
+              <h3 class="text-[14px] font-semibold text-v2-text-primary">{ctx.t("keysHeading")}</h3>
+              <p class="text-[12px] text-v2-text-secondary">{ctx.t("keysSub")}</p>
+            </div>
 
-          <div class="flex flex-col gap-3 rounded-lg border border-v2-border-subtle p-3">
-            <For each={keyStatuses()}>
-              {(prov) => (
-                <div class="flex flex-col gap-1">
-                  <div class="flex items-center justify-between text-[12px]">
-                    <span class="font-medium text-v2-text-primary">
-                      {prov.name} ({prov.envKey})
-                    </span>
-                    <div class="flex items-center gap-2">
-                      <span class="text-v2-text-secondary">
-                        {prov.hasKey ? `Ready (${prov.maskedKey})` : "Not configured"}
+            <div class="flex flex-col gap-3 rounded-lg border border-v2-border-subtle p-3">
+              <For each={keyStatuses()}>
+                {(prov) => (
+                  <div class="flex flex-col gap-1">
+                    <div class="flex items-center justify-between text-[12px]">
+                      <span class="font-medium text-v2-text-primary">
+                        {prov.name} ({prov.envKey})
                       </span>
-                      <Show when={prov.id !== "runpod"}>
-                        <Button size="small" variant="ghost" onClick={() => onTestProvider(prov.id)}>
-                          {ctx.t("testBtn")}
-                        </Button>
-                      </Show>
+                      <div class="flex items-center gap-2">
+                        <span class="text-v2-text-secondary">
+                          {prov.hasKey ? `Ready (${prov.maskedKey})` : "Not configured"}
+                        </span>
+                        <Show when={prov.id !== "runpod"}>
+                          <Button size="small" variant="ghost" onClick={() => onTestProvider(prov.id)}>
+                            {ctx.t("testBtn")}
+                          </Button>
+                        </Show>
+                      </div>
                     </div>
+                    <input
+                      type="password"
+                      value={draftKeys[prov.id] ?? ""}
+                      onInput={(e) => setDraftKeys(prov.id, e.currentTarget.value)}
+                      placeholder={`Enter new ${prov.name} API key or leave blank`}
+                      class="w-full rounded px-2.5 py-1.5 text-[12px] bg-v2-background-bg-base border border-v2-border-subtle text-v2-text-primary outline-none"
+                    />
                   </div>
-                  <input
-                    type="password"
-                    value={draftKeys[prov.id] ?? ""}
-                    onInput={(e) => setDraftKeys(prov.id, e.currentTarget.value)}
-                    placeholder={`Enter new ${prov.name} API key or leave blank`}
-                    class="w-full rounded px-2.5 py-1.5 text-[12px] bg-v2-background-bg-base border border-v2-border-subtle text-v2-text-primary outline-none"
-                  />
-                </div>
-              )}
-            </For>
+                )}
+              </For>
 
-            <div class="flex items-center justify-between pt-2">
-              <span class="text-[12px] text-v2-text-secondary">{testOutput()}</span>
-              <Button size="small" variant="submit" onClick={onSaveKeys}>
-                {ctx.t("saveKeysBtn")}
-              </Button>
+              <div class="flex items-center justify-between pt-2">
+                <span class="text-[12px] text-v2-text-secondary">{testOutput()}</span>
+                <Button size="small" variant="submit" onClick={onSaveKeys}>
+                  {ctx.t("saveKeysBtn")}
+                </Button>
+              </div>
             </div>
           </div>
+
+          {/* Section 2: Per-Bubble Appearance & Conversation Width */}
+          <div class="flex flex-col gap-2">
+            <div class="flex items-center justify-between">
+              <div class="flex flex-col gap-0.5">
+                <h3 class="text-[14px] font-semibold text-v2-text-primary">{ctx.t("bubblesHeading")}</h3>
+                <p class="text-[12px] text-v2-text-secondary">{ctx.t("bubblesSub")}</p>
+              </div>
+              <Button size="small" variant="ghost" onClick={() => applyPreset("theme")}>
+                {ctx.t("resetThemeBtn")}
+              </Button>
+            </div>
+
+            <div class="flex flex-col gap-3 rounded-lg border border-v2-border-subtle p-3 text-[12px]">
+              <div class="flex items-center justify-between">
+                <span class="font-medium text-v2-text-primary">Bubble Style Preset</span>
+                <select
+                  value={appearance.value.preset}
+                  onChange={(e) => applyPreset(e.currentTarget.value as BubblePreset)}
+                  class="rounded px-2 py-1 bg-v2-background-bg-base border border-v2-border-subtle text-v2-text-primary"
+                >
+                  <option value="theme">Match Theme (Default)</option>
+                  <option value="multicode">MultiCode Classic</option>
+                  <option value="poe-indigo">Poe Indigo &amp; Gray</option>
+                  <option value="antigravity-blue">Antigravity Clean</option>
+                  <option value="custom">Custom</option>
+                </select>
+              </div>
+
+              <div class="grid grid-cols-3 gap-2">
+                <label class="flex flex-col gap-1">
+                  <span class="text-v2-text-secondary">Prompt (Input)</span>
+                  <div class="flex items-center gap-1.5">
+                    <input
+                      type="color"
+                      value={appearance.value.promptBg}
+                      onInput={(e) => setCustomColor("promptBg", e.currentTarget.value)}
+                    />
+                    <span class="font-mono">{appearance.value.promptBg}</span>
+                  </div>
+                </label>
+
+                <label class="flex flex-col gap-1">
+                  <span class="text-v2-text-secondary">Response (Output)</span>
+                  <div class="flex items-center gap-1.5">
+                    <input
+                      type="color"
+                      value={appearance.value.responseBg}
+                      onInput={(e) => setCustomColor("responseBg", e.currentTarget.value)}
+                    />
+                    <span class="font-mono">{appearance.value.responseBg}</span>
+                  </div>
+                </label>
+
+                <label class="flex flex-col gap-1">
+                  <span class="text-v2-text-secondary">Thinking Trace</span>
+                  <div class="flex items-center gap-1.5">
+                    <input
+                      type="color"
+                      value={appearance.value.thinkingBg}
+                      onInput={(e) => setCustomColor("thinkingBg", e.currentTarget.value)}
+                    />
+                    <span class="font-mono">{appearance.value.thinkingBg}</span>
+                  </div>
+                </label>
+              </div>
+
+              {/* Live Mini Chat Bubble Preview */}
+              <div class="flex flex-col gap-2 rounded p-2.5 border border-v2-border-subtle bg-v2-background-bg-base">
+                <div class="flex justify-end">
+                  <div
+                    class="rounded-lg px-2.5 py-1.5 text-[11px] font-medium"
+                    style={{
+                      "background-color": appearance.value.promptBg,
+                      color: contrastTextForHex(appearance.value.promptBg),
+                    }}
+                  >
+                    Juliet, how do these new ABuCode bubble colors look?
+                  </div>
+                </div>
+                <div
+                  class="flex flex-col gap-1.5 rounded-lg p-2 text-[11px]"
+                  style={{
+                    "background-color": appearance.value.responseBg,
+                    color: contrastTextForHex(appearance.value.responseBg),
+                  }}
+                >
+                  <div
+                    class="rounded px-2 py-1 text-[10px]"
+                    style={{ "background-color": appearance.value.thinkingBg }}
+                  >
+                    💭 Thinking Trace: Checking pom-poms and strawberry lollipops...
+                  </div>
+                  <div>
+                    <strong>Juliet Starling:</strong> Oh my gosh, Mano, they look <em>totally</em> gorgeous!! ♥
+                  </div>
+                </div>
+              </div>
+
+              <div class="flex items-center justify-between pt-1">
+                <span class="font-medium text-v2-text-primary">Conversation Width</span>
+                <div class="flex gap-1">
+                  <For each={["narrow", "default", "wide", "fill"] as const}>
+                    {(w) => (
+                      <Button
+                        size="small"
+                        variant={appearance.value.width === w ? "submit" : "ghost"}
+                        onClick={() => setWidth(w)}
+                      >
+                        {w[0]!.toUpperCase() + w.slice(1)}
+                      </Button>
+                    )}
+                  </For>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Section 3: Desktop Global Summon & System Tray */}
+          <Show when={summonIpc && summonState()}>
+            <div class="flex flex-col gap-2">
+              <div class="flex flex-col gap-0.5">
+                <h3 class="text-[14px] font-semibold text-v2-text-primary">{ctx.t("summonHeading")}</h3>
+                <p class="text-[12px] text-v2-text-secondary">{ctx.t("summonSub")}</p>
+              </div>
+
+              <div class="flex flex-col gap-3 rounded-lg border border-v2-border-subtle p-3 text-[12px]">
+                <div class="flex items-center justify-between">
+                  <span class="font-medium text-v2-text-primary">Global Summon Hotkey</span>
+                  <select
+                    value={summonState()?.hotkey ?? "Alt+Space"}
+                    onChange={(e) => {
+                      const next = e.currentTarget.value as HotkeyPreset
+                      void summonIpc
+                        ?.setHotkey(next, { signal: ctx.signal })
+                        .then((st) => setSummonState(st))
+                        .catch(reportError)
+                    }}
+                    class="rounded px-2 py-1 bg-v2-background-bg-base border border-v2-border-subtle text-v2-text-primary"
+                  >
+                    <For each={HOTKEY_OPTIONS}>
+                      {(opt) => <option value={opt.value}>{opt.label}</option>}
+                    </For>
+                  </select>
+                </div>
+
+                <label class="flex items-center justify-between cursor-pointer">
+                  <span class="font-medium text-v2-text-primary">Close Window to System Tray</span>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(summonState()?.closeToTray)}
+                    onChange={(e) => {
+                      void summonIpc
+                        ?.setCloseToTray(e.currentTarget.checked, { signal: ctx.signal })
+                        .then((st) => setSummonState(st))
+                        .catch(reportError)
+                    }}
+                  />
+                </label>
+
+                <label class="flex items-center justify-between cursor-pointer">
+                  <span class="font-medium text-v2-text-primary">Always on Top</span>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(summonState()?.alwaysOnTop)}
+                    onChange={(e) => {
+                      void summonIpc
+                        ?.setAlwaysOnTop(e.currentTarget.checked, { signal: ctx.signal })
+                        .then((st) => setSummonState(st))
+                        .catch(reportError)
+                    }}
+                  />
+                </label>
+              </div>
+            </div>
+          </Show>
         </div>
       )
     },

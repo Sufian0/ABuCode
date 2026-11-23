@@ -24,6 +24,11 @@ const dict = {
   saveKeysBtn: "Save Keys",
   testBtn: "Test Connection",
   keysSaved: "Saved provider keys to .env.local",
+  bubblesHeading: "Chat Bubble Colors & Conversation Width",
+  bubblesSub: "Customize Prompt, Character Response, and Thinking Trace bubble colors plus timeline width.",
+  resetThemeBtn: "Reset to Theme",
+  summonHeading: "Desktop Global Summon & System Tray",
+  summonSub: "Toggle ABuCode from anywhere with Alt+Space and keep it resident in the system tray.",
   requestFailed: "ABuCode update failed",
 } as const
 

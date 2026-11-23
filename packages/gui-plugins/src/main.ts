@@ -33,5 +33,5 @@ export const builtins = compose({
   "microsoft-office": microsoftOffice,
   sources,
   goal,
-  abucode,
+  abucode: { ...abucode, mainEntry: () => import("./abucode/main") },
 })
