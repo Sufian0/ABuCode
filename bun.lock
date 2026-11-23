@@ -260,6 +260,7 @@
         "@opencode/ai": "workspace:*",
         "@opencode/codemode": "workspace:*",
         "@opencode/plugin": "workspace:*",
+        "@opencode/plugin-abucode": "workspace:*",
         "@opencode/plugin-browser": "workspace:*",
         "@opencode/pty": "0.4.0",
         "@opencode/schema": "workspace:*",
@@ -538,6 +539,25 @@
         "vite",
         "vite-plugin-solid",
       ],
+    },
+    "packages/plugin-abucode": {
+      "name": "@opencode/plugin-abucode",
+      "version": "2.2.5",
+      "dependencies": {
+        "@opencode/ai": "workspace:*",
+        "@opencode/plugin": "workspace:*",
+        "@opencode/schema": "workspace:*",
+        "@opencode/util": "workspace:*",
+        "@playwright/test": "catalog:",
+        "effect": "catalog:",
+      },
+      "devDependencies": {
+        "@tsconfig/bun": "catalog:",
+        "@types/bun": "catalog:",
+        "@types/node": "catalog:",
+        "@typescript/native": "catalog:",
+        "typescript": "catalog:",
+      },
     },
     "packages/plugin-browser": {
       "name": "@opencode/plugin-browser",
@@ -1925,6 +1945,8 @@
     "@opencode/patchmark": ["@opencode/patchmark@workspace:packages/patchmark"],
 
     "@opencode/plugin": ["@opencode/plugin@workspace:packages/plugin"],
+
+    "@opencode/plugin-abucode": ["@opencode/plugin-abucode@workspace:packages/plugin-abucode"],
 
     "@opencode/plugin-browser": ["@opencode/plugin-browser@workspace:packages/plugin-browser"],
 

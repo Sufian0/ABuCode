@@ -1,0 +1,191 @@
+import fs from "node:fs"
+import path from "node:path"
+import { resolveContentRoot } from "./content-paths.js"
+
+const DIRECTIVE_MODEL_ALIASES: Readonly<Record<string, string>> = {
+  "gemini-4-argon": "Google/Gemini_4_Argon.md",
+  "gemini-4-carbon": "Google/Gemini_4_Argon.md",
+  "google/gemini-4-argon": "Google/Gemini_4_Argon.md",
+  "google/gemini-4-carbon": "Google/Gemini_4_Argon.md",
+  "cargon-4": "Google/Gemini_4_Argon.md",
+  "cargon-4t": "Google/Gemini_4_Argon.md",
+  "gemini-3-8-flash": "Google/Gemini_3.8_Flash.md",
+  "google/gemini-3.8-flash": "Google/Gemini_3.8_Flash.md",
+  "claude-fable-5-1": "Anthropic/Fable_5.1.md",
+  "claude-fable-5-2": "Anthropic/Fable_5.1.md",
+  "anthropic/claude-fable-5.1": "Anthropic/Fable_5.1.md",
+  "anthropic/claude-fable-5.2": "Anthropic/Fable_5.1.md",
+  "cfable-51": "Anthropic/Fable_5.1.md",
+  "cfable-51t": "Anthropic/Fable_5.1.md",
+  "claude-opus-4-6": "Anthropic/Opus_4.6.md",
+  "anthropic/claude-opus-4.6": "Anthropic/Opus_4.6.md",
+  "claude-opus-4-7": "Anthropic/Opus_4.7.md",
+  "anthropic/claude-opus-4.7": "Anthropic/Opus_4.7.md",
+  "claude-opus-4-8": "Anthropic/Opus_4.8.md",
+  "anthropic/claude-opus-4.8": "Anthropic/Opus_4.8.md",
+  "claude-opus-5": "Anthropic/Opus_5.md",
+  "anthropic/claude-opus-5": "Anthropic/Opus_5.md",
+  "claude-opus-5-5": "Anthropic/Opus_5.5.md",
+  "anthropic/claude-opus-5.5": "Anthropic/Opus_5.5.md",
+  "claude-sonnet-4-5": "Anthropic/Sonnet_4.5.md",
+  "anthropic/claude-sonnet-4.5": "Anthropic/Sonnet_4.5.md",
+  "claude-sonnet-4-6": "Anthropic/Sonnet_4.6.md",
+  "anthropic/claude-sonnet-4.6": "Anthropic/Sonnet_4.6.md",
+  "claude-sonnet-5-5": "Anthropic/Sonnet_5.5.md",
+  "anthropic/claude-sonnet-5.5": "Anthropic/Sonnet_5.5.md",
+  "claude-haiku-5-5": "Anthropic/Haiku_5.5.md",
+  "anthropic/claude-haiku-5.5": "Anthropic/Haiku_5.5.md",
+  "deepseek-v4-pro-0813": "other_LLM/DeepSeek_4_Pro.md",
+  "deepseek/deepseek-v4-pro": "other_LLM/DeepSeek_4_Pro.md",
+  "empiriolabs/deepseek-v4-pro-el": "other_LLM/DeepSeek_4_Pro.md",
+  "deepseek-v4-1-flash-uncensored": "other_LLM/DeepSeek_4_Pro.md",
+  "deepseek/deepseek-v4.1-flash-uncensored": "other_LLM/DeepSeek_4_Pro.md",
+  "grok-4-7": "Grok/Grok_4.7.md",
+  "x-ai/grok-4.7": "Grok/Grok_4.7.md",
+  "grok-4-6": "Grok/Grok_4.6.md",
+  "x-ai/grok-4.6": "Grok/Grok_4.6.md",
+  "grok-4-5": "Grok/Grok_4.5.md",
+  "x-ai/grok-4.5": "Grok/Grok_4.5.md",
+  "xai/grok-4.20-multi-agent": "Grok/Grok_4.7.md",
+  "qwen-3-8-max": "other_LLM/Qwen_3.8_Max.md",
+  "qwen/qwen3.8-max": "other_LLM/Qwen_3.8_Max.md",
+  "gemma-4-31b-it-fabled": "Google/Gemma_4_31B_N.md",
+  "openai/gpt-5.4": "OpenAI/ChatGPT_5.4.md",
+  "gpt-5-4": "OpenAI/ChatGPT_5.4.md",
+  "openai-gpt-61-sol": "OpenAI/GPT_6.1_Sol.md",
+  "openai/gpt-6.1-sol": "OpenAI/GPT_6.1_Sol.md",
+  "gpt-6-1-sol": "OpenAI/GPT_6.1_Sol.md",
+  "gpt-6.1-sol": "OpenAI/GPT_6.1_Sol.md",
+  "openai-gpt-6-sol": "OpenAI/GPT_6_Sol.md",
+  "openai/gpt-6-sol": "OpenAI/GPT_6_Sol.md",
+  "openai-gpt-6-luna": "OpenAI/GPT_6_Luna.md",
+  "openai/gpt-6-luna": "OpenAI/GPT_6_Luna.md",
+  "openai-gpt-6-astra": "OpenAI/GPT_6_Astra.md",
+  "openai/gpt-6-astra": "OpenAI/GPT_6_Astra.md",
+}
+
+const DIRECTIVE_FAMILY_FALLBACKS: ReadonlyArray<readonly [readonly string[], string]> = [
+  [["fable"], "Anthropic/Fable_5.1.md"],
+  [["opus"], "Anthropic/Opus_4.6.md"],
+  [["sonnet"], "Anthropic/Sonnet_4.6.md"],
+  [["haiku"], "Anthropic/Haiku_5.5.md"],
+  [["claude", "anthropic"], "Anthropic/Sonnet_4.6.md"],
+  [["argon", "carbon"], "Google/Gemini_4_Argon.md"],
+  [["gemma"], "Google/Gemma_4.md"],
+  [["gemini", "google"], "Google/Gemini_3.8_Flash.md"],
+  [["grok", "xai", "x-ai"], "Grok/Grok_4.7.md"],
+  [["deepseek"], "other_LLM/DeepSeek_4_Pro.md"],
+  [["qwen"], "other_LLM/Qwen_3.8_Max.md"],
+  [["glm"], "GLM/GLM_5.3.md"],
+  [["kimi", "moonshot"], "Kimi/Kimi_K3.md"],
+  [["mistral"], "Mistral/Mistral_Large_4.md"],
+  [["muse", "llama", "meta"], "Meta_Muse/Meta_Muse_1.1.md"],
+  [["step"], "Step/Step_5_Preview.md"],
+  [["minimax"], "other_LLM/MiniMax_M3.md"],
+  [["gpt", "openai", "chatgpt", "o1", "o3", "o4"], "OpenAI/ChatGPT_5.4.md"],
+]
+
+function normalizeModelTokens(text: string): string[] {
+  const norm = text.trim().toLowerCase().replace(/(\d)[._-](\d)/g, "$1.$2")
+  return norm.split(/[^a-z0-9.]+/).filter((token) => token.length > 0)
+}
+
+function readTrimmedFile(target: string): string | undefined {
+  try {
+    if (!fs.statSync(target).isFile()) return undefined
+    return fs.readFileSync(target, "utf8").trim()
+  } catch {
+    return undefined
+  }
+}
+
+function walkMarkdownFiles(dir: string): string[] {
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true })
+    return entries
+      .flatMap((entry) => {
+        const full = path.join(dir, entry.name)
+        if (entry.isDirectory()) return walkMarkdownFiles(full)
+        if (entry.isFile() && entry.name.toLowerCase().endsWith(".md")) return [full]
+        return []
+      })
+      .sort()
+  } catch {
+    return []
+  }
+}
+
+export function resolveLlmDirective(input: {
+  readonly model?: string
+  readonly provider?: string
+  readonly family?: string
+  readonly contentRoot?: string
+}): string {
+  const root = input.contentRoot ?? resolveContentRoot()
+  const directivesDir = path.join(root, "Bots", "Directives")
+  const cleanModel = (input.model ?? "").trim()
+  const lowerModel = cleanModel.toLowerCase()
+
+  if (fs.existsSync(directivesDir)) {
+    const aliasRel = DIRECTIVE_MODEL_ALIASES[lowerModel]
+    if (aliasRel) {
+      const hit = readTrimmedFile(path.join(directivesDir, aliasRel))
+      if (hit !== undefined) return hit
+    }
+
+    const mdFiles = walkMarkdownFiles(directivesDir)
+    if (mdFiles.length > 0) {
+      const slugModel = lowerModel.replace(/[^a-z0-9]+/g, "")
+      if (slugModel) {
+        for (const file of mdFiles) {
+          const stemSlug = path.basename(file, ".md").toLowerCase().replace(/[^a-z0-9]+/g, "")
+          if (stemSlug === slugModel) {
+            const hit = readTrimmedFile(file)
+            if (hit !== undefined) return hit
+          }
+        }
+      }
+
+      const queryTokens = new Set(normalizeModelTokens(`${cleanModel} ${input.family ?? ""}`))
+      let bestFile: string | undefined
+      let bestScore = 0
+      for (const file of mdFiles) {
+        const stemTokens = normalizeModelTokens(path.basename(file, ".md"))
+        if (stemTokens.length === 0) continue
+        const overlap = stemTokens.filter((token) => queryTokens.has(token)).length
+        if (overlap >= 2 || (overlap === stemTokens.length && overlap >= 1)) {
+          const score = overlap * 10 - stemTokens.length
+          if (score > bestScore) {
+            bestScore = score
+            bestFile = file
+          }
+        }
+      }
+      if (bestFile) {
+        const hit = readTrimmedFile(bestFile)
+        if (hit !== undefined) return hit
+      }
+
+      const combinedHint = `${lowerModel} ${(input.family ?? "").toLowerCase()} ${(input.provider ?? "").toLowerCase()}`
+      for (const pair of DIRECTIVE_FAMILY_FALLBACKS) {
+        const keywords = pair[0]
+        const relPath = pair[1]
+        if (keywords.some((kw) => combinedHint.includes(kw))) {
+          const hit = readTrimmedFile(path.join(directivesDir, relPath))
+          if (hit !== undefined) return hit
+        }
+      }
+
+      for (const defaultRel of ["Google/Gemini_4_Argon.md", "Google/Gemini_3.8_Flash.md", "default.md"]) {
+        const hit = readTrimmedFile(path.join(directivesDir, defaultRel))
+        if (hit !== undefined) return hit
+      }
+
+      const first = mdFiles[0] ? readTrimmedFile(mdFiles[0]) : undefined
+      if (first !== undefined) return first
+    }
+  }
+
+  const fallbackDefault = readTrimmedFile(path.join(root, "Bots", "Prompts", "directives", "default.md"))
+  return fallbackDefault ?? ""
+}
