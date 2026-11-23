@@ -1,17 +1,29 @@
-import { app, type BrowserWindow, globalShortcut, Menu, nativeImage, Tray } from "electron"
+import { app, type BrowserWindow, globalShortcut, Menu, nativeImage, Notification, Tray } from "electron"
 import { Schema } from "effect"
 import type { Plugin } from "@opencode/plugin/gui/main"
 import { DesktopSummon, HotkeyPreset, type SummonState } from "./contract"
 
-// Crisp 16x16 sapphire/violet diamond tray icon encoded inline so dev and packaged builds always have a valid tray image.
 const TRAY_ICON_DATA_URL =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWklEQVR4nGNgGAWDEaiqqv7PwMDAwMjIyICPjU1dXR27JrACXBqxGcLIyIjNEFxm4DKEmZkZThMwg4GBgYGRkREuA+IzBF0DNgNQNcA0YDOEmM2DmIEYBgYAvfcR8d5vNdcAAAAASUVORK5CYII="
+
+const FALLBACK_ACCELERATORS: readonly Exclude<HotkeyPreset, "None">[] = [
+  "CommandOrControl+Shift+Space",
+  "Alt+Shift+M",
+  "CommandOrControl+Alt+M",
+]
 
 const StoredPrefs = Schema.Struct({
   hotkey: HotkeyPreset,
   closeToTray: Schema.Boolean,
   alwaysOnTop: Schema.Boolean,
 })
+
+const FOCUS_COMPOSER_SCRIPT = `(() => {
+  const active = document.activeElement;
+  if (active && (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT' || active.isContentEditable)) return;
+  const candidate = document.querySelector('[data-slot="composer-input"], [contenteditable="true"], textarea:not([disabled])');
+  if (candidate && typeof candidate.focus === 'function') candidate.focus();
+})()`
 
 const setup: Plugin.MainSetup = (ctx) => {
   const prefs = ctx.storage.store("summonPrefs", {
@@ -26,11 +38,22 @@ const setup: Plugin.MainSetup = (ctx) => {
   const runtime = {
     quitting: false,
     activeAccelerator: "" as string,
+    usedFallback: false,
     registered: false,
+    lastAlertSignature: "" as string,
     tray: undefined as Tray | undefined,
   }
 
   const pickTargetWindow = (): BrowserWindow | undefined => ctx.windows.focused() ?? ctx.windows.list()[0]
+
+  const focusComposerInWindow = (win: BrowserWindow) => {
+    try {
+      win.webContents.focus()
+      void win.webContents.executeJavaScript(FOCUS_COMPOSER_SCRIPT, true).catch(() => undefined)
+    } catch {
+      // Safe ignore while page is navigating
+    }
+  }
 
   const summonWindow = (): boolean => {
     const win = pickTargetWindow()
@@ -38,6 +61,7 @@ const setup: Plugin.MainSetup = (ctx) => {
     if (win.isMinimized()) win.restore()
     if (!win.isVisible()) win.show()
     win.focus()
+    focusComposerInWindow(win)
     return true
   }
 
@@ -57,9 +81,10 @@ const setup: Plugin.MainSetup = (ctx) => {
       try {
         globalShortcut.unregister(runtime.activeAccelerator)
       } catch {
-        // Ignore if app already tore down shortcuts
+        // Ignore teardown race
       }
       runtime.activeAccelerator = ""
+      runtime.usedFallback = false
       runtime.registered = false
     }
   }
@@ -67,13 +92,34 @@ const setup: Plugin.MainSetup = (ctx) => {
   const applyHotkey = (preset: HotkeyPreset) => {
     unregisterHotkey()
     if (preset === "None") return
+
     try {
-      const ok = globalShortcut.register(preset, toggleSummon)
-      runtime.registered = ok
-      if (ok) runtime.activeAccelerator = preset
+      if (globalShortcut.register(preset, toggleSummon)) {
+        runtime.activeAccelerator = preset
+        runtime.usedFallback = false
+        runtime.registered = true
+        return
+      }
     } catch {
-      runtime.registered = false
+      // Proceed to fallback chain
     }
+
+    // Automatic MultiCode-style fallback chain when Alt+Space is held by PowerToys Run / ChatGPT
+    for (const candidate of FALLBACK_ACCELERATORS) {
+      if (candidate === preset) continue
+      try {
+        if (globalShortcut.register(candidate, toggleSummon)) {
+          runtime.activeAccelerator = candidate
+          runtime.usedFallback = true
+          runtime.registered = true
+          return
+        }
+      } catch {
+        continue
+      }
+    }
+
+    runtime.registered = false
   }
 
   const applyAlwaysOnTopAll = (enabled: boolean) => {
@@ -84,10 +130,13 @@ const setup: Plugin.MainSetup = (ctx) => {
 
   const rebuildTrayMenu = () => {
     if (!runtime.tray) return
-    const hk = prefs.value.hotkey
+    const boundLabel = runtime.activeAccelerator || (prefs.value.hotkey === "None" ? "None" : "Unavailable")
     const menu = Menu.buildFromTemplate([
       {
-        label: hk === "None" ? "Summon ABuCode" : `Summon / Hide (${hk})`,
+        label:
+          prefs.value.hotkey === "None"
+            ? "Summon ABuCode"
+            : `Summon / Hide (${boundLabel}${runtime.usedFallback ? " · fallback" : ""})`,
         click: () => summonWindow(),
       },
       { type: "separator" },
@@ -123,22 +172,69 @@ const setup: Plugin.MainSetup = (ctx) => {
         },
       },
     ])
-    runtime.tray.setToolTip(`ABuCode${hk !== "None" ? ` (${hk})` : ""}`)
+    runtime.tray.setToolTip(`ABuCode${runtime.activeAccelerator ? ` (${runtime.activeAccelerator})` : ""}`)
     runtime.tray.setContextMenu(menu)
+  }
+
+  const notifyApprovalIfHidden = (title: string, body: string): boolean => {
+    const win = pickTargetWindow()
+    const isHiddenOrUnfocused = !win || win.isDestroyed() || !win.isVisible() || win.isMinimized() || !win.isFocused()
+    if (!isHiddenOrUnfocused) return false
+
+    const sig = `${title}|${body}`
+    if (runtime.lastAlertSignature === sig) return false
+    runtime.lastAlertSignature = sig
+
+    const hkHint = runtime.activeAccelerator ? ` (Press ${runtime.activeAccelerator} or click to review)` : ""
+    const fullBody = `${body}${hkHint}`
+
+    if (process.platform === "win32" && runtime.tray) {
+      try {
+        runtime.tray.displayBalloon({
+          title,
+          content: fullBody,
+          iconType: "info",
+        })
+        return true
+      } catch {
+        // Fall back to Electron Notification below
+      }
+    }
+
+    try {
+      if (Notification.isSupported()) {
+        const notif = new Notification({ title, body: fullBody })
+        notif.on("click", () => {
+          summonWindow()
+        })
+        notif.show()
+        return true
+      }
+    } catch {
+      // Ignore unsupported headless environments
+    }
+    return false
   }
 
   const attachWindowHooks = (win: BrowserWindow) => {
     if (win.isDestroyed()) return
     win.setAlwaysOnTop(prefs.value.alwaysOnTop)
+    const onFocus = () => {
+      runtime.lastAlertSignature = ""
+    }
     const onClose = (event: Electron.Event) => {
       if (!runtime.quitting && prefs.value.closeToTray) {
         event.preventDefault()
         win.hide()
       }
     }
+    win.on("focus", onFocus)
     win.on("close", onClose)
     ctx.onCleanup(() => {
-      if (!win.isDestroyed()) win.removeListener("close", onClose)
+      if (!win.isDestroyed()) {
+        win.removeListener("focus", onFocus)
+        win.removeListener("close", onClose)
+      }
     })
   }
 
@@ -151,6 +247,7 @@ const setup: Plugin.MainSetup = (ctx) => {
     const img = nativeImage.createFromDataURL(TRAY_ICON_DATA_URL)
     runtime.tray = new Tray(img)
     runtime.tray.on("click", () => toggleSummon())
+    runtime.tray.on("balloon-click", () => summonWindow())
     rebuildTrayMenu()
   } catch {
     // Headless test environments without a system tray continue gracefully
@@ -168,6 +265,7 @@ const setup: Plugin.MainSetup = (ctx) => {
   }
 
   applyHotkey(prefs.value.hotkey)
+  rebuildTrayMenu()
 
   ctx.onCleanup(() => {
     app.removeListener("before-quit", onBeforeQuit)
@@ -180,6 +278,8 @@ const setup: Plugin.MainSetup = (ctx) => {
 
   const currentState = (): SummonState => ({
     hotkey: prefs.value.hotkey,
+    activeAccelerator: runtime.activeAccelerator,
+    usedFallback: runtime.usedFallback,
     registered: runtime.registered,
     closeToTray: prefs.value.closeToTray,
     alwaysOnTop: prefs.value.alwaysOnTop,
@@ -211,6 +311,7 @@ const setup: Plugin.MainSetup = (ctx) => {
       return currentState()
     },
     summonNow: () => summonWindow(),
+    notifyApprovalIfHidden: (input) => notifyApprovalIfHidden(input.title, input.body),
   })
 }
 

@@ -12,11 +12,19 @@ export type HotkeyPreset = typeof HotkeyPreset.Type
 
 export const SummonState = Schema.Struct({
   hotkey: HotkeyPreset,
+  activeAccelerator: Schema.String,
+  usedFallback: Schema.Boolean,
   registered: Schema.Boolean,
   closeToTray: Schema.Boolean,
   alwaysOnTop: Schema.Boolean,
 })
 export type SummonState = typeof SummonState.Type
+
+export const ApprovalNotifyInput = Schema.Struct({
+  title: Schema.String,
+  body: Schema.String,
+})
+export type ApprovalNotifyInput = typeof ApprovalNotifyInput.Type
 
 export const DesktopSummon = Ipc.define({
   id: "abucode.summon",
@@ -26,5 +34,6 @@ export const DesktopSummon = Ipc.define({
     setCloseToTray: { input: Schema.Boolean, output: SummonState },
     setAlwaysOnTop: { input: Schema.Boolean, output: SummonState },
     summonNow: { output: Schema.Boolean },
+    notifyApprovalIfHidden: { input: ApprovalNotifyInput, output: Schema.Boolean },
   },
 })

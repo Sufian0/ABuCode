@@ -359,8 +359,10 @@ export class RepetitionLoopDetector {
     }
     if (this.buffer.length < this.minPhraseLen * this.minRepeats) return false
 
-    for (const phraseLen of [32, 48, 64, 96]) {
-      if (this.buffer.length < phraseLen * this.minRepeats) continue
+    const maxLen = Math.min(180, Math.floor(this.buffer.length / this.minRepeats))
+    const lastChar = this.buffer[this.buffer.length - 1]
+    for (let phraseLen = this.minPhraseLen; phraseLen <= maxLen; phraseLen++) {
+      if (this.buffer[this.buffer.length - 1 - phraseLen] !== lastChar) continue
       const tail = this.buffer.slice(-phraseLen)
       if (!tail.trim()) continue
       let count = 0
@@ -375,13 +377,21 @@ export class RepetitionLoopDetector {
   }
 }
 
+export const LOOP_BREAKER_NOTE = "\n\n[Stopped: repetition loop detected by ABuCode circuit breaker.]"
+export const MAIN_CHAT_TRUNCATED_NOTE =
+  "\n\n*(Note: Response reached the model's output token limit and was truncated.)*"
+
 function transformStreamWithGuardrails(
   source: ReadableStream<LanguageModelV3StreamPart>,
   opts: { readonly xmlMode: boolean },
 ): ReadableStream<LanguageModelV3StreamPart> {
-  const detector = new RepetitionLoopDetector()
+  const textDetector = new RepetitionLoopDetector()
+  const reasoningDetector = new RepetitionLoopDetector({ windowChars: 3200, minPhraseLen: 40, minRepeats: 6 })
   let fullText = ""
   let lastTextId = "abucode-text-0"
+  let lastReasoningId = "abucode-reasoning-0"
+  let textBlockOpen = false
+  let reasoningBlockOpen = false
   let cutByLoop = false
 
   return new ReadableStream<LanguageModelV3StreamPart>({
@@ -393,8 +403,44 @@ function transformStreamWithGuardrails(
           if (step.done) break
           const part = step.value
 
+          if (part.type === "reasoning-start") {
+            lastReasoningId = part.id
+            reasoningBlockOpen = true
+            controller.enqueue(part)
+            continue
+          }
+
+          if (part.type === "reasoning-delta") {
+            lastReasoningId = part.id
+            if (reasoningDetector.feed(part.delta)) {
+              cutByLoop = true
+              if (reasoningBlockOpen) {
+                controller.enqueue({ type: "reasoning-end", id: lastReasoningId })
+                reasoningBlockOpen = false
+              }
+              if (opts.xmlMode) {
+                fullText += LOOP_BREAKER_NOTE
+              } else {
+                controller.enqueue({ type: "text-start", id: lastTextId })
+                controller.enqueue({ type: "text-delta", id: lastTextId, delta: LOOP_BREAKER_NOTE })
+                controller.enqueue({ type: "text-end", id: lastTextId })
+              }
+              await reader.cancel("reasoning-repetition-loop")
+              break
+            }
+            controller.enqueue(part)
+            continue
+          }
+
+          if (part.type === "reasoning-end") {
+            reasoningBlockOpen = false
+            controller.enqueue(part)
+            continue
+          }
+
           if (part.type === "text-start") {
             lastTextId = part.id
+            textBlockOpen = true
             if (!opts.xmlMode) controller.enqueue(part)
             continue
           }
@@ -402,12 +448,15 @@ function transformStreamWithGuardrails(
           if (part.type === "text-delta") {
             lastTextId = part.id
             fullText += part.delta
-            if (detector.feed(part.delta)) {
+            if (textDetector.feed(part.delta)) {
               cutByLoop = true
-              const note = "\n\n[Stopped: repetition loop detected by ABuCode circuit breaker.]"
-              if (!opts.xmlMode) {
-                controller.enqueue({ type: "text-delta", id: lastTextId, delta: note })
+              if (opts.xmlMode) {
+                fullText += LOOP_BREAKER_NOTE
+              } else {
+                if (!textBlockOpen) controller.enqueue({ type: "text-start", id: lastTextId })
+                controller.enqueue({ type: "text-delta", id: lastTextId, delta: LOOP_BREAKER_NOTE })
                 controller.enqueue({ type: "text-end", id: lastTextId })
+                textBlockOpen = false
               }
               await reader.cancel("repetition-loop")
               break
@@ -417,17 +466,25 @@ function transformStreamWithGuardrails(
           }
 
           if (part.type === "text-end") {
+            textBlockOpen = false
             if (!opts.xmlMode) controller.enqueue(part)
             continue
           }
 
           if (part.type === "finish") {
+            const isTruncatedLength =
+              part.finishReason.unified === "length" || String(part.finishReason.raw ?? "").toLowerCase() === "length"
+
             if (opts.xmlMode) {
               const extracted = extractXmlToolCalls(fullText).filter(
                 (item): item is ExtractedXmlToolCall & { arguments: Record<string, unknown> } =>
                   Boolean(item.name && item.arguments && !item.error),
               )
-              const cleanedText = stripXmlToolCalls(fullText, extracted)
+              const cleanedBase = stripXmlToolCalls(fullText, extracted)
+              const cleanedText =
+                isTruncatedLength && extracted.length === 0
+                  ? `${cleanedBase}${MAIN_CHAT_TRUNCATED_NOTE}`
+                  : cleanedBase
               if (cleanedText) {
                 controller.enqueue({ type: "text-start", id: lastTextId })
                 controller.enqueue({ type: "text-delta", id: lastTextId, delta: cleanedText })
@@ -448,6 +505,11 @@ function transformStreamWithGuardrails(
                 })
                 continue
               }
+            } else if (isTruncatedLength) {
+              const truncId = `${lastTextId}-trunc`
+              controller.enqueue({ type: "text-start", id: truncId })
+              controller.enqueue({ type: "text-delta", id: truncId, delta: MAIN_CHAT_TRUNCATED_NOTE })
+              controller.enqueue({ type: "text-end", id: truncId })
             }
             controller.enqueue(part)
             continue
@@ -457,6 +519,14 @@ function transformStreamWithGuardrails(
         }
 
         if (cutByLoop) {
+          if (opts.xmlMode && fullText.trim()) {
+            const cleaned = stripXmlToolCalls(fullText)
+            if (cleaned) {
+              controller.enqueue({ type: "text-start", id: lastTextId })
+              controller.enqueue({ type: "text-delta", id: lastTextId, delta: cleaned })
+              controller.enqueue({ type: "text-end", id: lastTextId })
+            }
+          }
           controller.enqueue({
             type: "finish",
             finishReason: { unified: "stop", raw: "repetition_loop" },

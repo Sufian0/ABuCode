@@ -7,6 +7,35 @@ import { optional } from "./schema.js"
 export const PolicyTier = Schema.Literals(["request_review", "default", "auto", "turbo"])
 export type PolicyTier = typeof PolicyTier.Type
 
+export const SquadRoleName = Schema.Literals(["scout", "investigator", "skeptic", "reviewer"])
+export type SquadRoleName = typeof SquadRoleName.Type
+
+export const SquadRoleRouting = Schema.Struct({
+  /** "auto" or integer string "0".."6" */
+  count: Schema.String,
+  /** "same" | "venice" | "nano-gpt" | "poe" */
+  provider: Schema.String,
+  /** "same" or explicit model ID */
+  model: Schema.String,
+  /** "auto" | "same" | "low" | "medium" | "high" | "xhigh" | "max" */
+  effort: Schema.String,
+})
+export type SquadRoleRouting = typeof SquadRoleRouting.Type
+
+export const SquadSettings = Schema.Struct({
+  enabled: Schema.Boolean,
+  /** "auto" (up to 12) or "4" | "6" | "8" | "10" | "12" */
+  maxAgents: Schema.String,
+  costThresholdUsd: Schema.Number,
+  roles: Schema.Struct({
+    scout: SquadRoleRouting,
+    investigator: SquadRoleRouting,
+    skeptic: SquadRoleRouting,
+    reviewer: SquadRoleRouting,
+  }),
+})
+export type SquadSettings = typeof SquadSettings.Type
+
 export const CharacterEntry = Schema.Struct({
   key: Schema.String,
   display: Schema.String,
@@ -21,6 +50,7 @@ export const SessionSettings = Schema.Struct({
   characterLabel: Schema.String,
   memory: Schema.String,
   policy: PolicyTier,
+  squad: optional(SquadSettings),
 })
 export type SessionSettings = typeof SessionSettings.Type
 
@@ -38,6 +68,7 @@ export const Catalog = Schema.Struct({
   wildcards: Schema.Array(CharacterEntry),
   defaultCharacter: Schema.String,
   defaultPolicy: PolicyTier,
+  defaultSquad: optional(SquadSettings),
   contentRoot: Schema.String,
 })
 export type Catalog = typeof Catalog.Type
@@ -50,6 +81,22 @@ export const ConnectionTestResult = Schema.Struct({
   error: optional(Schema.String),
 })
 export type ConnectionTestResult = typeof ConnectionTestResult.Type
+
+export const CompactionSummaryResult = Schema.Struct({
+  compacted: Schema.Boolean,
+  compactedCount: Schema.Number,
+  tokensSaved: Schema.Number,
+  summary: Schema.String,
+  settings: SessionSettings,
+})
+export type CompactionSummaryResult = typeof CompactionSummaryResult.Type
+
+export const ApprovalAlert = Schema.Struct({
+  sessionID: Schema.String,
+  title: Schema.String,
+  detail: Schema.String,
+})
+export type ApprovalAlert = typeof ApprovalAlert.Type
 
 export const Definition = Rpc.define({
   id: "abucode.control",
@@ -81,11 +128,31 @@ export const Definition = Rpc.define({
       ),
       output: Schema.toStandardSchemaV1(SessionSettings),
     },
+    compactToMemory: {
+      input: Schema.toStandardSchemaV1(
+        Schema.Struct({
+          sessionID: Schema.String,
+          keepLast: optional(Schema.Number),
+          note: optional(Schema.String),
+        }),
+      ),
+      output: Schema.toStandardSchemaV1(CompactionSummaryResult),
+    },
     setPolicy: {
       input: Schema.toStandardSchemaV1(
         Schema.Struct({
           sessionID: Schema.String,
           policy: PolicyTier,
+          saveAsDefault: optional(Schema.Boolean),
+        }),
+      ),
+      output: Schema.toStandardSchemaV1(SessionSettings),
+    },
+    setSquad: {
+      input: Schema.toStandardSchemaV1(
+        Schema.Struct({
+          sessionID: Schema.String,
+          squad: SquadSettings,
           saveAsDefault: optional(Schema.Boolean),
         }),
       ),
@@ -122,6 +189,8 @@ export const Definition = Rpc.define({
           settings: optional(SessionSettings),
           defaultCharacter: optional(Schema.String),
           defaultPolicy: optional(PolicyTier),
+          defaultSquad: optional(SquadSettings),
+          approvalAlert: optional(ApprovalAlert),
         }),
       ),
     },
