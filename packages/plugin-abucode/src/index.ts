@@ -2,7 +2,9 @@ import { SystemPart } from "@opencode/ai/effect"
 import { define } from "@opencode/plugin/effect/plugin"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
 import { ABuCode, type PolicyTier, type SessionSettings } from "@opencode/schema/abucode"
-import { Effect, Option, Schema } from "effect"
+import { Session } from "@opencode/schema/session"
+import { DateTime, Effect, Option, Schema } from "effect"
+import { archiveSessionToChatHistory, type ArchivableTurn } from "./archiver.js"
 import { resolveContentRoot } from "./content-paths.js"
 import {
   composeCharacterSystemPrompt,
@@ -218,6 +220,62 @@ export default define({
     yield* ctx.session.hook("context", injectContext)
     yield* ctx.session.hook("generate", injectContext)
 
+    const archiveLiveSession = (sessionID: Session.ID) =>
+      Effect.gen(function* () {
+        const info = yield* ctx.session.get({ sessionID })
+        // Skip child subagent sessions so only primary user chats write top-level transcripts.
+        if (info.parentID) return []
+        const rawMessages = yield* ctx.session.context({ sessionID })
+        const settings = yield* buildSessionSettings(sessionID)
+
+        const turns: ArchivableTurn[] = rawMessages.flatMap((msg): ArchivableTurn[] => {
+          if (msg.type === "user") {
+            return [
+              {
+                role: "user",
+                content: msg.text,
+                timestampMs: DateTime.toEpochMillis(msg.time.created),
+              },
+            ]
+          }
+          if (msg.type === "assistant") {
+            const textParts = msg.content.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("\n\n")
+            const thinkParts = msg.content
+              .flatMap((p) => (p.type === "reasoning" ? [p.text] : []))
+              .join("\n\n")
+            if (!textParts.trim() && !thinkParts.trim()) return []
+            return [
+              {
+                role: "assistant",
+                content: textParts,
+                reasoning: thinkParts || undefined,
+                timestampMs: DateTime.toEpochMillis(msg.time.created),
+                provider: String(msg.model.providerID),
+                model: String(msg.model.id),
+                effort: msg.model.variant ? String(msg.model.variant) : undefined,
+                character: settings.characterLabel,
+              },
+            ]
+          }
+          return []
+        })
+
+        if (turns.length === 0) return []
+        return archiveSessionToChatHistory({
+          id: String(info.id),
+          title: info.title ?? "ABuCode Session",
+          createdMs: DateTime.toEpochMillis(info.time.created),
+          updatedMs: DateTime.toEpochMillis(info.time.updated),
+          cwd: ctx.location.directory ?? process.cwd(),
+          character: settings.characterLabel,
+          messages: turns,
+        })
+      }).pipe(Effect.catchCause(() => Effect.succeed([] as string[])))
+
+    yield* ctx.session.hook("experimental.idle", (event) =>
+      archiveLiveSession(event.sessionID).pipe(Effect.asVoid),
+    )
+
     yield* ctx.command.transform((editor) => {
       editor.add({
         name: "character",
@@ -303,6 +361,69 @@ export default define({
               return
             }
             return yield* Effect.fail(new Error("Usage: /keys [status | test venice | test nano-gpt | test poe]"))
+          }).pipe(Effect.asVoid),
+      })
+
+      editor.add({
+        name: "memory",
+        description: "view, set, or clear Pinned Session Memory (/memory [show | clear | <notes>])",
+        execute: (input) =>
+          Effect.gen(function* () {
+            const raw = input.prompt.text.trim()
+            const current = yield* buildSessionSettings(input.sessionID)
+            if (!raw || raw.toLowerCase() === "show") {
+              return yield* Effect.fail(
+                new Error(
+                  current.memory.trim()
+                    ? `Pinned Session Memory:\n\n${current.memory}\n\nUse '/memory clear' to clear or '/memory <notes>' to update.`
+                    : "No Pinned Session Memory set. Use '/memory <notes>' to pin instructions for every turn in this chat.",
+                ),
+              )
+            }
+            if (raw.toLowerCase() === "clear") {
+              yield* removeKey(sessionMemKey(input.sessionID))
+              const next = yield* buildSessionSettings(input.sessionID)
+              yield* emitChanged({ sessionID: input.sessionID, settings: next })
+              yield* ctx.session.synthetic({
+                sessionID: input.sessionID,
+                text: "Cleared Pinned Session Memory.",
+                description: "Pinned Memory cleared",
+                metadata: { source: "abucode.memory" },
+                delivery: input.delivery,
+              })
+              return
+            }
+            yield* writeStr(sessionMemKey(input.sessionID), raw)
+            const next = yield* buildSessionSettings(input.sessionID)
+            yield* emitChanged({ sessionID: input.sessionID, settings: next })
+            yield* ctx.session.synthetic({
+              sessionID: input.sessionID,
+              text: `Updated Pinned Session Memory (${raw.length} chars).`,
+              description: "Pinned Memory updated",
+              metadata: { source: "abucode.memory" },
+              delivery: input.delivery,
+            })
+          }).pipe(Effect.asVoid),
+      })
+
+      editor.add({
+        name: "archive",
+        description: "write this session's GMT+8 Markdown transcript to zzz_local/Chat-History now",
+        execute: (input) =>
+          Effect.gen(function* () {
+            const written = yield* archiveLiveSession(input.sessionID)
+            if (written.length === 0) {
+              return yield* Effect.fail(
+                new Error("No zzz_local/Chat-History directory found (or session has no turns yet)."),
+              )
+            }
+            yield* ctx.session.synthetic({
+              sessionID: input.sessionID,
+              text: `Archived session Markdown to:\n${written.map((p) => `- \`${p}\``).join("\n")}`,
+              description: `Archived to Chat-History (${written.length} target${written.length === 1 ? "" : "s"})`,
+              metadata: { source: "abucode.archive" },
+              delivery: input.delivery,
+            })
           }).pipe(Effect.asVoid),
       })
     })
