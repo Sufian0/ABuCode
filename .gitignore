@@ -1,7 +1,6 @@
 .DS_Store
 node_modules
 .worktrees
-.sst
 .env
 .env.local
 zzz_local
@@ -38,3 +37,9 @@ logs/
 *.bun-build
 tsconfig.tsbuildinfo
 /artifacts/
+
+# Legal drafts pending review are kept outside the repository; never copy them in.
+legal-drafts-private/
+
+# Claude Code state for sessions working in this repo (worktrees, local settings).
+/.claude/
