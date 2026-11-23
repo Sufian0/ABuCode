@@ -833,6 +833,7 @@ export const builtins = compose({
   "microsoft-office": microsoftOffice,
   sources,
   goal,
+  abucode: { ...abucode, mainEntry: () => import("./abucode/main") },
 })
 ```
 
@@ -858,6 +859,7 @@ export const builtins = compose({
   "microsoft-office": { ...microsoftOffice, windowEntry: eager(microsoftOfficeRenderer) },
   sources: { ...sources, windowEntry: eager(sourcesRenderer) },
   goal: { ...goal, windowEntry: eager(goalRenderer) },
+  abucode: { ...abucode, windowEntry: eager(abucodeRenderer) },
 })
 ```
 
