@@ -165,9 +165,17 @@ export function composeCharacterSystemPrompt(input: {
   readonly contentRoot?: string
 }): string {
   const norm = normalizeCharacterChoice(input.character)
-  if (norm === "none") return ""
-
   const root = input.contentRoot ?? resolveContentRoot()
+
+  const directiveText = resolveLlmDirective({
+    model: input.model,
+    provider: input.provider,
+    family: input.family,
+    contentRoot: root,
+  }).trim()
+
+  if (norm === "none") return directiveText
+
   const chosen =
     norm === "random"
       ? (FALLBACK_CHARACTERS[Math.floor(Math.random() * FALLBACK_CHARACTERS.length)]?.key ?? "Cortana")
@@ -192,13 +200,6 @@ export function composeCharacterSystemPrompt(input: {
     "- Stay 100% authentic to the character's personality, voice, body language, attire, and mannerisms at all times.",
     "- First-person thinking and action. Show personality before showing competence.",
   ].join("\n")
-
-  const directiveText = resolveLlmDirective({
-    model: input.model,
-    provider: input.provider,
-    family: input.family,
-    contentRoot: root,
-  }).trim()
 
   const basePrompt = directiveText ? `${directiveText}\n\n${header}` : header
   const validCards = charList.map((name) => resolveCharacterCard(name, root).trim()).filter((card) => card.length > 0)
