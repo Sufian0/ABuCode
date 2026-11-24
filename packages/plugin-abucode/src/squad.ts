@@ -1141,13 +1141,16 @@ const defaultAgentLlmCaller: AgentLlmCaller = async (req) => {
   }
   const chosenModel = req.model.trim() || meta.defaultModel
   const isPoe = meta.id === "poe"
+  const isVenice = meta.id === "venice"
   const body: Record<string, unknown> = {
     model: chosenModel,
     messages: req.messages,
     stream: false,
+    ...(isVenice ? { venice_parameters: { include_venice_system_prompt: false } } : {}),
   }
   if (req.effort && req.effort !== "default" && !(isPoe && CUSTOM_POE_BOTS.has(chosenModel))) {
-    body.reasoning_effort = req.effort
+    if (isVenice) body.reasoning = { effort: req.effort }
+    if (!isVenice) body.reasoning_effort = req.effort
   }
   if (req.includeNativeTools && !isPoe) {
     body.tools = READ_ONLY_TOOL_SCHEMAS
