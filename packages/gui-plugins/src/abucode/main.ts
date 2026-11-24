@@ -1,10 +1,11 @@
+import { existsSync, writeFileSync } from "node:fs"
+import path from "node:path"
+import { fileURLToPath } from "node:url"
 import { app, type BrowserWindow, globalShortcut, Menu, nativeImage, Notification, Tray } from "electron"
 import { Schema } from "effect"
 import type { Plugin } from "@opencode/plugin/gui/main"
+import { ABU_ICO_BASE64, ABU_PNG_256_BASE64, ABU_TRAY_DATA_URL } from "./brand-icons"
 import { DesktopSummon, HotkeyPreset, type SummonState } from "./contract"
-
-const TRAY_ICON_DATA_URL =
-  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWklEQVR4nGNgGAWDEaiqqv7PwMDAwMjIyICPjU1dXR27JrACXBqxGcLIyIjNEFxm4DKEmZkZThMwg4GBgYGRkREuA+IzBF0DNgNQNcA0YDOEmM2DmIEYBgYAvfcR8d5vNdcAAAAASUVORK5CYII="
 
 const FALLBACK_ACCELERATORS: readonly Exclude<HotkeyPreset, "None">[] = [
   "CommandOrControl+Shift+Space",
@@ -25,6 +26,15 @@ const FOCUS_COMPOSER_SCRIPT = `(() => {
   if (candidate && typeof candidate.focus === 'function') candidate.focus();
 })()`
 
+interface RuntimeState {
+  quitting: boolean
+  activeAccelerator: string
+  usedFallback: boolean
+  registered: boolean
+  lastAlertSignature: string
+  tray: Tray | undefined
+}
+
 const setup: Plugin.MainSetup = (ctx) => {
   const prefs = ctx.storage.store("summonPrefs", {
     schema: StoredPrefs,
@@ -35,13 +45,13 @@ const setup: Plugin.MainSetup = (ctx) => {
     },
   })
 
-  const runtime = {
+  const runtime: RuntimeState = {
     quitting: false,
-    activeAccelerator: "" as string,
+    activeAccelerator: "",
     usedFallback: false,
     registered: false,
-    lastAlertSignature: "" as string,
-    tray: undefined as Tray | undefined,
+    lastAlertSignature: "",
+    tray: undefined,
   }
 
   const pickTargetWindow = (): BrowserWindow | undefined => ctx.windows.focused() ?? ctx.windows.list()[0]
@@ -57,22 +67,31 @@ const setup: Plugin.MainSetup = (ctx) => {
 
   const summonWindow = (): boolean => {
     const win = pickTargetWindow()
+
     if (!win || win.isDestroyed()) return false
+
     if (win.isMinimized()) win.restore()
+
     if (!win.isVisible()) win.show()
+
     win.focus()
     focusComposerInWindow(win)
+
     return true
   }
 
   const toggleSummon = () => {
     const win = pickTargetWindow()
+
     if (!win || win.isDestroyed()) return
+
     if (win.isVisible() && win.isFocused() && !win.isMinimized()) {
       if (prefs.value.closeToTray) win.hide()
       else win.minimize()
+
       return
     }
+
     summonWindow()
   }
 
@@ -83,6 +102,7 @@ const setup: Plugin.MainSetup = (ctx) => {
       } catch {
         // Ignore teardown race
       }
+
       runtime.activeAccelerator = ""
       runtime.usedFallback = false
       runtime.registered = false
@@ -91,6 +111,7 @@ const setup: Plugin.MainSetup = (ctx) => {
 
   const applyHotkey = (preset: HotkeyPreset) => {
     unregisterHotkey()
+
     if (preset === "None") return
 
     try {
@@ -98,6 +119,7 @@ const setup: Plugin.MainSetup = (ctx) => {
         runtime.activeAccelerator = preset
         runtime.usedFallback = false
         runtime.registered = true
+
         return
       }
     } catch {
@@ -107,11 +129,13 @@ const setup: Plugin.MainSetup = (ctx) => {
     // Automatic MultiCode-style fallback chain when Alt+Space is held by PowerToys Run / ChatGPT
     for (const candidate of FALLBACK_ACCELERATORS) {
       if (candidate === preset) continue
+
       try {
         if (globalShortcut.register(candidate, toggleSummon)) {
           runtime.activeAccelerator = candidate
           runtime.usedFallback = true
           runtime.registered = true
+
           return
         }
       } catch {
@@ -130,7 +154,9 @@ const setup: Plugin.MainSetup = (ctx) => {
 
   const rebuildTrayMenu = () => {
     if (!runtime.tray) return
+
     const boundLabel = runtime.activeAccelerator || (prefs.value.hotkey === "None" ? "None" : "Unavailable")
+
     const menu = Menu.buildFromTemplate([
       {
         label:
@@ -172,6 +198,7 @@ const setup: Plugin.MainSetup = (ctx) => {
         },
       },
     ])
+
     runtime.tray.setToolTip(`ABuCode${runtime.activeAccelerator ? ` (${runtime.activeAccelerator})` : ""}`)
     runtime.tray.setContextMenu(menu)
   }
@@ -179,10 +206,13 @@ const setup: Plugin.MainSetup = (ctx) => {
   const notifyApprovalIfHidden = (title: string, body: string): boolean => {
     const win = pickTargetWindow()
     const isHiddenOrUnfocused = !win || win.isDestroyed() || !win.isVisible() || win.isMinimized() || !win.isFocused()
+
     if (!isHiddenOrUnfocused) return false
 
     const sig = `${title}|${body}`
+
     if (runtime.lastAlertSignature === sig) return false
+
     runtime.lastAlertSignature = sig
 
     const hkHint = runtime.activeAccelerator ? ` (Press ${runtime.activeAccelerator} or click to review)` : ""
@@ -195,6 +225,7 @@ const setup: Plugin.MainSetup = (ctx) => {
           content: fullBody,
           iconType: "info",
         })
+
         return true
       } catch {
         // Fall back to Electron Notification below
@@ -208,28 +239,70 @@ const setup: Plugin.MainSetup = (ctx) => {
           summonWindow()
         })
         notif.show()
+
         return true
       }
     } catch {
       // Ignore unsupported headless environments
     }
+
     return false
   }
 
+  const prepareBrandIcons = (): string | Electron.NativeImage => {
+    const icoBytes = Buffer.from(ABU_ICO_BASE64, "base64")
+    const pngBytes = Buffer.from(ABU_PNG_256_BASE64, "base64")
+
+    try {
+      const userIco = path.join(app.getPath("userData"), "abu-taskbar.ico")
+
+      writeFileSync(userIco, icoBytes)
+
+      if (!app.isPackaged) {
+        const mainDir = path.dirname(fileURLToPath(import.meta.url))
+        const devIconsDir = path.join(mainDir, "../../resources/icons")
+
+        if (existsSync(devIconsDir)) {
+          writeFileSync(path.join(devIconsDir, "icon.ico"), icoBytes)
+          writeFileSync(path.join(devIconsDir, "icon.png"), pngBytes)
+        }
+      }
+
+      if (process.platform === "win32") return userIco
+    } catch {
+      // Fall back to in-memory NativeImage below
+    }
+
+    return nativeImage.createFromBuffer(pngBytes)
+  }
+
+  const windowIcon = prepareBrandIcons()
+
   const attachWindowHooks = (win: BrowserWindow) => {
     if (win.isDestroyed()) return
+
+    try {
+      win.setIcon(windowIcon)
+    } catch {
+      // Ignore platforms such as macOS where BrowserWindow.setIcon is a no-op
+    }
+
     win.setAlwaysOnTop(prefs.value.alwaysOnTop)
+
     const onFocus = () => {
       runtime.lastAlertSignature = ""
     }
+
     const onClose = (event: Electron.Event) => {
       if (!runtime.quitting && prefs.value.closeToTray) {
         event.preventDefault()
         win.hide()
       }
     }
+
     win.on("focus", onFocus)
     win.on("close", onClose)
+
     ctx.onCleanup(() => {
       if (!win.isDestroyed()) {
         win.removeListener("focus", onFocus)
@@ -241,10 +314,11 @@ const setup: Plugin.MainSetup = (ctx) => {
   const onBeforeQuit = () => {
     runtime.quitting = true
   }
+
   app.on("before-quit", onBeforeQuit)
 
   try {
-    const img = nativeImage.createFromDataURL(TRAY_ICON_DATA_URL)
+    const img = nativeImage.createFromDataURL(ABU_TRAY_DATA_URL)
     runtime.tray = new Tray(img)
     runtime.tray.on("click", () => toggleSummon())
     runtime.tray.on("balloon-click", () => summonWindow())
@@ -256,6 +330,7 @@ const setup: Plugin.MainSetup = (ctx) => {
   for (const existing of ctx.windows.list()) {
     attachWindowHooks(existing)
   }
+
   ctx.windows.on("open", (win) => attachWindowHooks(win))
 
   if (process.argv.some((arg) => arg === "--minimized" || arg === "--tray" || arg === "--background")) {
@@ -270,6 +345,7 @@ const setup: Plugin.MainSetup = (ctx) => {
   ctx.onCleanup(() => {
     app.removeListener("before-quit", onBeforeQuit)
     unregisterHotkey()
+
     if (runtime.tray) {
       runtime.tray.destroy()
       runtime.tray = undefined
@@ -293,6 +369,7 @@ const setup: Plugin.MainSetup = (ctx) => {
       })
       applyHotkey(next)
       rebuildTrayMenu()
+
       return currentState()
     },
     setCloseToTray: (enabled) => {
@@ -300,6 +377,7 @@ const setup: Plugin.MainSetup = (ctx) => {
         draft.closeToTray = enabled
       })
       rebuildTrayMenu()
+
       return currentState()
     },
     setAlwaysOnTop: (enabled) => {
@@ -308,6 +386,7 @@ const setup: Plugin.MainSetup = (ctx) => {
       })
       applyAlwaysOnTopAll(enabled)
       rebuildTrayMenu()
+
       return currentState()
     },
     summonNow: () => summonWindow(),
