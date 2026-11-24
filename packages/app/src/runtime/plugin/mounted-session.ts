@@ -62,6 +62,36 @@ export type ScreenPrompt = {
 }
 
 export function createMountedSession(session: SessionModel) {
+  return createSessionView({
+    sessionID: session.identity.sessionID,
+    directory: session.workspace.directory,
+    tabKey: session.layout.tabKey,
+    isChild: session.data.isChild,
+    attach: true,
+  })
+}
+
+export function createDraftMountedSession(input: {
+  id: Accessor<string>
+  directory: Accessor<string>
+  tab: Accessor<string>
+}) {
+  return createSessionView({
+    sessionID: input.id,
+    directory: input.directory,
+    tabKey: input.tab,
+    isChild: () => false,
+    attach: false,
+  })
+}
+
+function createSessionView(target: {
+  sessionID: Accessor<string | undefined>
+  directory: Accessor<string>
+  tabKey: Accessor<string | undefined>
+  isChild: Accessor<boolean>
+  attach: boolean
+}) {
   const file = useFile()
   const comments = useComments()
   const composer = useComposerState()
@@ -234,12 +264,12 @@ export function createMountedSession(session: SessionModel) {
 
   // A subagent's session has no composer, so its draft is never sent.
   const edit = (apply: (draft: ReturnType<typeof createComposerEditorActions>) => void) => {
-    if (!session.data.isChild()) write((target) => apply(createComposerEditorActions(target.store)))
+    if (!target.isChild()) write((draft) => apply(createComposerEditorActions(draft.store)))
   }
 
   const composerRef: Composer = {
     text: () =>
-      session.data.isChild()
+      target.isChild()
         ? ""
         : composer
             .capture()
@@ -253,14 +283,14 @@ export function createMountedSession(session: SessionModel) {
     },
     setText: (value) => edit((draft) => draft.setText(value.replace(/\r\n?/g, "\n"))),
     model() {
-      const item = session.data.isChild() ? undefined : local.model.current()
+      const item = target.isChild() ? undefined : local.model.current()
 
       if (!item) return
 
       return { providerID: item.provider.id, modelID: item.id, variant: local.model.variant.current() }
     },
     setModel(model) {
-      const item = session.data.isChild()
+      const item = target.isChild()
         ? undefined
         : local.model.list().find((entry) => entry.provider.id === model.providerID && entry.id === model.modelID)
 
@@ -274,7 +304,7 @@ export function createMountedSession(session: SessionModel) {
       return true
     },
     setVariant(variant) {
-      if (session.data.isChild() || !local.model.current()) return false
+      if (target.isChild() || !local.model.current()) return false
 
       if (variant !== undefined && !local.model.variant.list().includes(variant)) return false
       local.model.variant.set(variant)
@@ -295,9 +325,9 @@ export function createMountedSession(session: SessionModel) {
     },
     update: (id, patch) => write((draft) => draft.context.updateComment(id, patch)),
     detach: (id) => write((draft) => draft.context.removeComment(id)),
-    delivery: () => (session.data.isChild() ? undefined : prompt()?.delivery()),
+    delivery: () => (target.isChild() ? undefined : prompt()?.delivery()),
     send(commentID) {
-      if (session.data.isChild()) return
+      if (target.isChild()) return
 
       // Behind the writes still waiting, so it finds a part an `attach` just before it added.
       write((draft) => {
@@ -380,9 +410,9 @@ export function createMountedSession(session: SessionModel) {
   // A new object for each routed session, and for the same session once it moves to another directory or its shell tab
   // is known: its fields never change. A moment without an id keeps the last one. A move is the same routing visit.
   const mounted = createMemo<MountedSession>((previous) => {
-    const id = session.identity.sessionID() ?? ""
-    const directory = session.workspace.directory()
-    const tab = session.layout.tabKey() ?? ""
+    const id = target.sessionID() ?? ""
+    const directory = target.directory()
+    const tab = target.tabKey() ?? ""
 
     if (previous && !id) return previous
 
@@ -400,16 +430,18 @@ export function createMountedSession(session: SessionModel) {
     )
   })
 
-  // The session's declared stores start loading now, before its regions read them.
-  createRenderEffect(on(mounted, (view) => attachment.preload(view)))
-  // Publish both after render, with the original session-mount timing. Renders receive their own screen directly;
-  // only global observers need this attachment. One batch prevents exposing a view on another screen.
-  createEffect(() =>
-    batch(() => {
-      onCleanup(attachment.screen(screen))
-      onCleanup(attachment.mount(mounted))
-    }),
-  )
+  if (target.attach) {
+    // The session's declared stores start loading now, before its regions read them.
+    createRenderEffect(on(mounted, (view) => attachment.preload(view)))
+    // Publish both after render, with the original session-mount timing. Renders receive their own screen directly;
+    // only global observers need this attachment. One batch prevents exposing a view on another screen.
+    createEffect(() =>
+      batch(() => {
+        onCleanup(attachment.screen(screen))
+        onCleanup(attachment.mount(mounted))
+      }),
+    )
+  }
 
   return {
     screen,
