@@ -40,6 +40,7 @@ import {
   appendCompactionSummaryToMemory,
   compactTurnsIntoMemory,
   derivePoeSmartTitle,
+  getStaticRepoMapBlock,
   type CompactableTurn,
 } from "./repo-context.js"
 import {
@@ -379,11 +380,26 @@ export default define({
 
     const injectContext = (event: SessionHooks["context"]) =>
       Effect.gen(function* () {
+        const providerID = String(event.model.providerID)
+        const modelID = String(event.model.id)
+        const variantID = event.model.variant ? String(event.model.variant) : ""
         sessionActiveModels.set(event.sessionID, {
-          provider: String(event.model.providerID),
-          model: String(event.model.id),
-          effort: event.model.variant ? String(event.model.variant) : "",
+          provider: providerID,
+          model: modelID,
+          effort: variantID,
         })
+
+        // When Venice or NanoGPT runs on "default" (unset) variant, cap default reasoning effort at "medium"
+        // so routine file-read / tool-call steps don't burn 20-55s each in unbounded max thinking.
+        // Selecting "low", "high", "xhigh", or "max" in the UI variant picker still takes full precedence.
+        if (
+          (providerID === "venice" || providerID === "nano-gpt") &&
+          (!variantID || variantID === "default") &&
+          event.options.reasoningEffort === undefined &&
+          event.options.reasoning === undefined
+        ) {
+          event.options.reasoningEffort = "medium"
+        }
 
         const settings = yield* buildSessionSettings(event.sessionID)
         const parts: string[] = []
@@ -395,6 +411,9 @@ export default define({
           seed: event.sessionID,
         }).trim()
         if (personaPrompt) parts.push(personaPrompt)
+
+        const repoMapBlock = getStaticRepoMapBlock(ctx.location.directory ?? process.cwd())
+        if (repoMapBlock) parts.push(repoMapBlock)
 
         if (settings.memory.trim()) {
           parts.push(`## Pinned Session Context / Memory\n\n${settings.memory.trim()}`)
