@@ -1,29 +1,570 @@
+/* ==========================================================================
+   1. ABuCode Custom Bubble Colors & Conversation Width Presets
+   ========================================================================== */
+
 :root[data-abucode-bubbles="active"] [data-component="user-message"] [data-slot="user-message-text"] {
-  background-color: var(--abucode-prompt-bg) !important;
-  color: var(--abucode-prompt-fg, #ffffff) !important;
+  background-color: var(--abucode-prompt-bg);
+  color: var(--abucode-prompt-fg, #ffffff);
 }
 
-:root[data-abucode-bubbles="active"] [data-component="assistant-message"] [data-component="text-part"] {
+:root[data-abucode-bubbles="active"] [data-timeline-row] [data-component="text-part"]:not([data-component="user-message"] *) {
   background-color: var(--abucode-response-bg);
   color: var(--abucode-response-fg, inherit);
-  padding: 10px 14px;
-  border-radius: 10px;
+  padding: 12px 16px;
+  border-radius: 12px;
 }
 
 :root[data-abucode-bubbles="active"] [data-component="reasoning-part"] {
   background-color: var(--abucode-thinking-bg);
-  padding: 6px 10px;
-  border-radius: 8px;
+  padding: 8px 12px;
+  border-radius: 10px;
 }
 
 :root[data-abucode-width="narrow"] .md\:max-w-session {
-  max-width: 42rem !important;
+  max-width: 42rem;
 }
 
 :root[data-abucode-width="wide"] .md\:max-w-session {
-  max-width: 68rem !important;
+  max-width: 68rem;
 }
 
 :root[data-abucode-width="fill"] .md\:max-w-session {
-  max-width: 96% !important;
+  max-width: 96%;
+}
+
+/* ==========================================================================
+   2. Antigravity Palette Upgrade on Default Theme (Out-of-the-Box Zero Setup)
+   ========================================================================== */
+
+:root[data-abucode-skin="antigravity"][data-theme="oc-2"][data-color-scheme="light"] {
+  --v2-background-bg-base: #ffffff;
+  --v2-background-bg-deep: #f2f3f5;
+  --v2-background-bg-layer-01: #f4f5f7;
+  --v2-background-bg-layer-02: #ebedf0;
+  --v2-background-bg-layer-03: #e0e3e8;
+  --v2-background-bg-layer-04: #d3d7de;
+  --v2-background-bg-contrast: #0a0a0c;
+  --v2-background-bg-icon-button-contrast: #0a0a0c;
+  --v2-background-bg-accent: #2f75c3;
+  --v2-text-text-base: #0a0a0c;
+  --v2-text-text-muted: #5f6368;
+  --v2-text-text-faint: #80868b;
+  --v2-text-text-accent: #2f75c3;
+  --v2-text-text-accent-hover: #235ea1;
+  --v2-icon-icon-base: #3c4043;
+  --v2-icon-icon-muted: #5f6368;
+  --v2-icon-icon-faint: #80868b;
+  --v2-icon-icon-accent: #2f75c3;
+  --v2-icon-icon-accent-hover: #235ea1;
+  --v2-border-border-muted: rgba(10, 10, 12, 0.06);
+  --v2-border-border-base: rgba(10, 10, 12, 0.09);
+  --v2-border-border-strong: rgba(10, 10, 12, 0.16);
+  --v2-border-border-focus: #2f75c3;
+  --v2-elevation-raised: inset 0 0 0 1px rgba(10, 10, 12, 0.08);
+}
+
+:root[data-abucode-skin="antigravity"][data-theme="oc-2"][data-color-scheme="dark"] {
+  --v2-background-bg-base: #111215;
+  --v2-background-bg-deep: #070708;
+  --v2-background-bg-layer-01: #18191d;
+  --v2-background-bg-layer-02: #202227;
+  --v2-background-bg-layer-03: #2a2d33;
+  --v2-background-bg-layer-04: #373a42;
+  --v2-background-bg-contrast: #ffffff;
+  --v2-background-bg-icon-button-contrast: #ffffff;
+  --v2-background-bg-accent: #2f71e3;
+  --v2-text-text-base: #ffffff;
+  --v2-text-text-muted: #9aa0a6;
+  --v2-text-text-faint: #6e747c;
+  --v2-text-text-accent: #6da2ff;
+  --v2-text-text-accent-hover: #8ab4f8;
+  --v2-icon-icon-base: #e8eaed;
+  --v2-icon-icon-muted: #9aa0a6;
+  --v2-icon-icon-faint: #6e747c;
+  --v2-icon-icon-accent: #6da2ff;
+  --v2-icon-icon-accent-hover: #8ab4f8;
+  --v2-border-border-muted: rgba(255, 255, 255, 0.07);
+  --v2-border-border-base: rgba(255, 255, 255, 0.1);
+  --v2-border-border-strong: rgba(255, 255, 255, 0.18);
+  --v2-border-border-focus: #2f71e3;
+  --v2-elevation-raised: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+/* ==========================================================================
+   3. Shell Frame Gutters, Rounded Surfaces, Cards & Popovers
+   ========================================================================== */
+
+:root[data-abucode-skin="antigravity"] {
+  --radius-xs: 0.25rem;
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 0.875rem;
+}
+
+/* Give the white rounded content card a crisp Antigravity frame gutter on Windows desktop too. */
+:root[data-abucode-skin="antigravity"] div:has(> header[data-slot="titlebar-v2"]) {
+  --shell-top-inset: 6px !important;
+  --shell-inline-inset: 8px !important;
+  --shell-bottom-inset: 8px !important;
+}
+
+:root[data-abucode-skin="antigravity"] [data-slot="session-chat-panel"] > div:first-child,
+:root[data-abucode-skin="antigravity"] aside#review-panel,
+:root[data-abucode-skin="antigravity"] section#bottom-panel,
+:root[data-abucode-skin="antigravity"] [data-component="new-session"],
+:root[data-abucode-skin="antigravity"] [data-slot="home-panel"],
+:root[data-abucode-skin="antigravity"] .settings-screen {
+  border-radius: 14px;
+  box-shadow: var(--v2-elevation-raised);
+}
+
+/* Always-expanded "Open IDE" pill in the top-right bar on Home & New Session. */
+:root[data-abucode-skin="antigravity"] [data-slot="titlebar-update"]:has(> button[aria-label="Open project in external IDE"]) {
+  width: fit-content;
+  height: 28px;
+  background: var(--v2-background-bg-base);
+  box-shadow: inset 0 0 0 1px var(--v2-border-border-base);
+}
+
+:root[data-abucode-skin="antigravity"] [data-slot="titlebar-update"]:has(> button[aria-label="Open project in external IDE"]) > button {
+  padding-inline: 12px 10px;
+  gap: 6px;
+  background: transparent;
+  color: var(--v2-text-text-base);
+}
+
+:root[data-abucode-skin="antigravity"] [data-slot="titlebar-update"]:has(> button[aria-label="Open project in external IDE"]) > button:hover {
+  background: var(--v2-background-bg-layer-01);
+}
+
+:root[data-abucode-skin="antigravity"] [data-slot="titlebar-update"]:has(> button[aria-label="Open project in external IDE"]) [data-slot="titlebar-update-label"] {
+  opacity: 1;
+  translate: none;
+  margin-inline: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--v2-text-text-base);
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="menu-v2-content"],
+:root[data-abucode-skin="antigravity"] [data-component="select-v2-content"],
+:root[data-abucode-skin="antigravity"] [data-component="popover-content"] {
+  border-radius: 14px;
+  background: var(--v2-background-bg-base);
+  box-shadow:
+    inset 0 0 0 1px var(--v2-border-border-base),
+    0 12px 32px -6px rgba(0, 0, 0, 0.14),
+    0 4px 12px -2px rgba(0, 0, 0, 0.06);
+}
+
+:root[data-abucode-skin="antigravity"][data-color-scheme="dark"] [data-component="menu-v2-content"],
+:root[data-abucode-skin="antigravity"][data-color-scheme="dark"] [data-component="select-v2-content"],
+:root[data-abucode-skin="antigravity"][data-color-scheme="dark"] [data-component="popover-content"] {
+  background: var(--v2-background-bg-layer-01);
+  box-shadow:
+    inset 0 0 0 1px var(--v2-border-border-base),
+    0 16px 40px -6px rgba(0, 0, 0, 0.55);
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="dialog-v2"] [data-slot="dialog-container"] {
+  border-radius: 16px;
+  background: var(--v2-background-bg-base);
+  box-shadow:
+    inset 0 0 0 1px var(--v2-border-border-base),
+    0 20px 48px -8px rgba(0, 0, 0, 0.18),
+    0 6px 16px -4px rgba(0, 0, 0, 0.08);
+}
+
+:root[data-abucode-skin="antigravity"][data-color-scheme="dark"] [data-component="dialog-v2"] [data-slot="dialog-container"] {
+  background: var(--v2-background-bg-layer-01);
+  box-shadow:
+    inset 0 0 0 1px var(--v2-border-border-base),
+    0 24px 56px -8px rgba(0, 0, 0, 0.65);
+}
+
+/* ==========================================================================
+   4. New Session Hero Emblem, Greeting & Bottom-Docked Two-Tier Composer
+   ========================================================================== */
+
+/* Convert the mid-page absolute block into a full-height flex column so the greeting centers and composer docks bottom. */
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] > div:has([data-slot="new-session-composer"]) {
+  top: 0;
+  bottom: 0;
+  padding-top: 32px;
+  padding-bottom: 24px;
+  align-items: stretch;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] > div:has([data-slot="new-session-composer"]) > div {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  min-height: 100%;
+  width: 100%;
+  max-width: 780px;
+  margin-inline: auto;
+}
+
+/* Replace the blocky pixel-art opencode wordmark with Antigravity's smooth emblem + greeting. */
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] [data-component="new-session-wordmark"] {
+  margin-block: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  width: auto;
+  height: auto;
+  pointer-events: none;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] [data-component="new-session-wordmark"] > * {
+  display: none !important;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] [data-component="new-session-wordmark"]::before {
+  content: "";
+  display: block;
+  width: 248px;
+  height: 57px;
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: contain;
+  background-image: var(--abucode-hero-logo);
+  filter: drop-shadow(0 6px 18px rgba(0, 0, 0, 0.1));
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] [data-component="new-session-wordmark"]::after {
+  content: var(--abucode-greeting, "What should we build today?");
+  font-size: 25px;
+  line-height: 32px;
+  font-weight: 440;
+  letter-spacing: -0.022em;
+  color: var(--v2-text-text-base);
+  text-align: center;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] [data-component="new-session-wordmark"] + div {
+  margin-top: 0;
+  width: 100%;
+}
+
+/* Two-tier composer tray on New Session. */
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] [data-slot="new-session-composer"]:has(> :nth-child(2)) {
+  flex-direction: column-reverse;
+  gap: 4px;
+  padding: 6px;
+  border-radius: 22px;
+  background: var(--v2-background-bg-layer-01);
+  box-shadow: inset 0 0 0 1px var(--v2-border-border-muted);
+}
+
+/* Replace square letter ProjectAvatar with Antigravity's clean outline folder icon in the tray. */
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] [data-action="prompt-project"] {
+  border-radius: 9999px;
+  padding-inline: 10px;
+  gap: 6px;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] [data-action="prompt-project"] [data-component="project-avatar-v2"] {
+  display: none;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] [data-action="prompt-project"]::before {
+  content: "";
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  background-color: var(--v2-icon-icon-muted);
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2 4.2C2 3.53726 2.53726 3 3.2 3H6.15147C6.46973 3 6.77495 3.12643 7 3.35147L7.84853 4.2C8.07357 4.42505 8.37879 4.55147 8.69706 4.55147H12.8C13.4627 4.55147 14 5.08873 14 5.75147V11.8C14 12.4627 13.4627 13 12.8 13H3.2C2.53726 13 2 12.4627 2 11.8V4.2Z' stroke='black' stroke-width='1.3' stroke-linejoin='round'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2 4.2C2 3.53726 2.53726 3 3.2 3H6.15147C6.46973 3 6.77495 3.12643 7 3.35147L7.84853 4.2C8.07357 4.42505 8.37879 4.55147 8.69706 4.55147H12.8C13.4627 4.55147 14 5.08873 14 5.75147V11.8C14 12.4627 13.4627 13 12.8 13H3.2C2.53726 13 2 12.4627 2 11.8V4.2Z' stroke='black' stroke-width='1.3' stroke-linejoin='round'/%3E%3C/svg%3E");
+  -webkit-mask-size: contain;
+  mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+}
+
+/* Branch chip with trailing chevron (matching "dev v"). */
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] [data-action="prompt-worktree"] {
+  border-radius: 9999px;
+  padding-inline: 10px;
+  gap: 5px;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] [data-slot="workspace-onboarding-dot"] {
+  display: none;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] [data-action="prompt-worktree"]::after {
+  content: "";
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  background-color: var(--v2-icon-icon-muted);
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M4.5 6.25L8 9.75L11.5 6.25' stroke='black' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M4.5 6.25L8 9.75L11.5 6.25' stroke='black' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  -webkit-mask-size: contain;
+  mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+}
+
+/* Replace raw filesystem path string at right of tray with Antigravity's clean monitor icon (path stays in hover tooltip!). */
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] [data-slot="new-session-location-path"] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-inline-end: 6px;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] [data-slot="new-session-location-path"] > bdi {
+  display: none;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="new-session"] [data-slot="new-session-location-path"]::after {
+  content: "";
+  width: 16px;
+  height: 16px;
+  background-color: var(--v2-icon-icon-muted);
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Crect x='2' y='2.75' width='12' height='8.25' rx='1.5' stroke='black' stroke-width='1.3'/%3E%3Cpath d='M5.5 13.25H10.5M8 11V13.25' stroke='black' stroke-width='1.3' stroke-linecap='round'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Crect x='2' y='2.75' width='12' height='8.25' rx='1.5' stroke='black' stroke-width='1.3'/%3E%3Cpath d='M5.5 13.25H10.5M8 11V13.25' stroke='black' stroke-width='1.3' stroke-linecap='round'/%3E%3C/svg%3E");
+  -webkit-mask-size: contain;
+  mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+}
+
+:root[data-abucode-skin="antigravity"] form[data-component="composer"] {
+  border-radius: 16px;
+  background: var(--v2-background-bg-base);
+  box-shadow: inset 0 0 0 1px var(--v2-border-border-base);
+}
+
+:root[data-abucode-skin="antigravity"][data-color-scheme="dark"] form[data-component="composer"] {
+  background: var(--v2-background-bg-layer-01);
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="session-composer-dock"] {
+  border-radius: 20px;
+  padding: 4px;
+  background: var(--v2-background-bg-layer-01);
+  box-shadow: inset 0 0 0 1px var(--v2-border-border-muted);
+}
+
+:root[data-abucode-skin="antigravity"][data-color-scheme="dark"] [data-component="session-composer-dock"] {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="session-composer-dock"] [data-dock-border-underlay] {
+  border-radius: 16px;
+}
+
+/* Solid dark circular Send button like Antigravity (crisp even when input is empty). */
+:root[data-abucode-skin="antigravity"] [data-action="composer-submit"] {
+  border-radius: 9999px;
+  width: 32px;
+  height: 32px;
+  background: var(--v2-background-bg-icon-button-contrast);
+  color: var(--v2-text-text-contrast);
+  box-shadow: none;
+}
+
+:root[data-abucode-skin="antigravity"][data-color-scheme="dark"] [data-action="composer-submit"] {
+  color: var(--v2-icon-icon-inverse);
+}
+
+:root[data-abucode-skin="antigravity"] [data-action="composer-submit"]:is(:disabled, [data-state="disabled"]) {
+  opacity: 0.92;
+}
+
+:root[data-abucode-skin="antigravity"] [data-action="composer-attach"] {
+  border-radius: 9999px;
+}
+
+/* Keep the effort variant visible beside the model chip like Antigravity ("Gemini 4 Argon High"). */
+:root[data-abucode-skin="antigravity"] form[data-component="composer"] .composer-variant-default {
+  opacity: 0.78;
+  pointer-events: auto;
+}
+
+:root[data-abucode-skin="antigravity"] [data-composer-pill] {
+  border-radius: 9999px;
+  height: 30px;
+  padding-inline: 12px;
+  box-shadow: inset 0 0 0 1px var(--v2-border-border-base);
+}
+
+/* ==========================================================================
+   5. Pill Switches, Pill Dropdowns, Buttons & Segmented Controls
+   ========================================================================== */
+
+:root[data-abucode-skin="antigravity"] [data-component="button-v2"] {
+  border-radius: 9999px;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="select-v2"][data-appearance="inline"] {
+  border-radius: 9999px;
+  min-height: 30px;
+  padding-inline: 12px 8px;
+  background: var(--v2-background-bg-layer-01);
+  box-shadow: inset 0 0 0 1px var(--v2-border-border-muted);
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="select-v2"][data-appearance="inline"]:hover:not([data-disabled]) {
+  background: var(--v2-background-bg-layer-02);
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="segmented-control-v2"] {
+  border-radius: 9999px;
+  padding: 2px;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="segmented-control-v2"] [data-slot="segmented-control-v2-indicator"],
+:root[data-abucode-skin="antigravity"] [data-component="segmented-control-v2"] [data-slot="segmented-control-v2-item"] {
+  border-radius: 9999px;
+}
+
+/* Antigravity blue pill toggle switch (36x20 track, 16x16 round white thumb). */
+:root[data-abucode-skin="antigravity"] [data-component="switch"] [data-slot="switch-control"] {
+  width: 36px;
+  height: 20px;
+  padding: 2px;
+  border-radius: 9999px;
+  background: var(--v2-background-bg-layer-04);
+  box-shadow: none;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="switch"] [data-slot="switch-thumb"] {
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  border: none;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+  transform: translateX(0);
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="switch"]:hover:not([data-disabled], [data-readonly]) [data-slot="switch-thumb"] {
+  width: 16px;
+  border-radius: 9999px;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="switch"][data-checked] [data-slot="switch-control"] {
+  background: var(--v2-background-bg-accent);
+  box-shadow: none;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="switch"][data-checked] [data-slot="switch-thumb"] {
+  border-radius: 9999px;
+  background: #ffffff;
+  transform: translateX(16px);
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="switch"][data-checked]:hover:not([data-disabled], [data-readonly]) [data-slot="switch-thumb"] {
+  transform: translateX(16px);
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="switch"]:dir(rtl)[data-checked] [data-slot="switch-thumb"],
+:root[data-abucode-skin="antigravity"] [data-component="switch"]:dir(rtl)[data-checked]:hover:not([data-disabled], [data-readonly]) [data-slot="switch-thumb"] {
+  transform: translateX(-16px);
+}
+
+:root[data-abucode-skin="antigravity"] input[type="range"] {
+  accent-color: var(--v2-background-bg-accent);
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="interface-mode"] [data-slot="interface-mode-option"],
+:root[data-abucode-skin="antigravity"] [data-component="navigation-mode"] [data-slot="navigation-mode-option"] {
+  border-radius: 12px;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="interface-mode"] [data-slot="interface-mode-option"][data-checked],
+:root[data-abucode-skin="antigravity"] [data-component="navigation-mode"] [data-slot="navigation-mode-option"][data-checked] {
+  background-color: color-mix(in srgb, var(--v2-background-bg-accent) 8%, var(--v2-background-bg-base));
+  box-shadow: inset 0 0 0 1.5px var(--v2-border-border-focus);
+}
+
+/* ==========================================================================
+   6. Left Sidebar ("+ New Session" White Card Button & Roomy Rows)
+   ========================================================================== */
+
+:root[data-abucode-skin="antigravity"] [data-slot="vertical-tabs-mount"] [data-action="vertical-tabs-new-session"] {
+  order: -1;
+  min-height: 36px;
+  margin-bottom: 4px;
+  padding-inline: 12px;
+  border-radius: 10px;
+  background: var(--v2-background-bg-base);
+  box-shadow:
+    inset 0 0 0 1px var(--v2-border-border-base),
+    0 1px 2px rgba(0, 0, 0, 0.03);
+  font-weight: 500;
+}
+
+:root[data-abucode-skin="antigravity"][data-color-scheme="dark"] [data-slot="vertical-tabs-mount"] [data-action="vertical-tabs-new-session"] {
+  background: var(--v2-background-bg-layer-01);
+}
+
+:root[data-abucode-skin="antigravity"] [data-slot="vertical-tabs-mount"] [data-action="vertical-tabs-home"],
+:root[data-abucode-skin="antigravity"] [data-slot="vertical-tabs-mount"] [data-action="vertical-tabs-search"],
+:root[data-abucode-skin="antigravity"] [data-slot="vertical-tabs-mount"] [data-titlebar-tab] {
+  min-height: 34px;
+  border-radius: 8px;
+  padding-inline: 10px;
+}
+
+:root[data-abucode-skin="antigravity"] [data-slot="vertical-tabs-mount"] [data-slot="titlebar-tab-item"][data-has-project] [data-titlebar-tab] {
+  min-height: 48px;
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="menu-v2-item"],
+:root[data-abucode-skin="antigravity"] [data-component="select-v2-item"] {
+  min-height: 32px;
+  border-radius: 8px;
+}
+
+/* ==========================================================================
+   7. Settings Cards & Navigation
+   ========================================================================== */
+
+:root[data-abucode-skin="antigravity"] [data-component="settings-list"] {
+  border-radius: 12px;
+  background-color: var(--v2-background-bg-base);
+  box-shadow: inset 0 0 0 1px var(--v2-border-border-base);
+}
+
+:root[data-abucode-skin="antigravity"][data-color-scheme="dark"] [data-component="settings-list"] {
+  background-color: var(--v2-background-bg-layer-01);
+}
+
+:root[data-abucode-skin="antigravity"] .settings-nav-groups [data-slot="tabs-v2-trigger-wrapper"],
+:root[data-abucode-skin="antigravity"] .settings-nav-groups [data-slot="tabs-v2-trigger-wrapper"] button {
+  min-height: 34px;
+  border-radius: 8px;
+}
+
+/* ==========================================================================
+   8. Session Message Stream (Bubbles, Code Chips & Reply Footer)
+   ========================================================================== */
+
+:root[data-abucode-skin="antigravity"]:not([data-abucode-bubbles="active"]) [data-component="user-message"] [data-slot="user-message-text"] {
+  border-radius: 16px;
+  padding: 10px 16px;
+  background: var(--v2-background-bg-layer-01);
+  box-shadow: inset 0 0 0 1px var(--v2-border-border-muted);
+}
+
+:root[data-abucode-skin="antigravity"] [data-component="markdown"] {
+  --markdown-inline-code-radius: 6px;
+}
+
+:root[data-abucode-skin="antigravity"] [data-slot="text-part-copy-wrapper"] {
+  opacity: 0.72;
+  pointer-events: auto;
+}
+
+:root[data-abucode-skin="antigravity"] [data-slot="text-part-copy-wrapper"]:hover,
+:root[data-abucode-skin="antigravity"] [data-slot="text-part-copy-wrapper"]:focus-within {
+  opacity: 1;
 }
