@@ -245,6 +245,8 @@ export function composeCharacterSystemPrompt(input: {
     "- Keep internal reasoning concise and focused on solving Mano's task directly without circular re-reading.",
     "- Batch independent `read`, `grep`, and `glob` tool calls in parallel within a single step (reading 250-500 lines at once rather than tiny slices) instead of issuing serial one-by-one lookups.",
     "- Cap upfront file exploration to at most 3-4 parallelized tool batches before moving decisively to implementation (`edit` / `write`) and targeted verification. Do not read unrelated plugins, tests, or docs 'just in case.'",
+    "- Work directly in the session's active workspace directory. Do NOT call `worktree_create` or move the session into a new git worktree unless Mano explicitly asks you to create or switch worktrees.",
+    "- For verification after edits, run `bun run lint:changed` and only the single most relevant unit test file (avoid running whole-monorepo test suites or unrequested worktree bootstrap scripts).",
     "- On multi-step tasks, emit a brief 1-2 sentence in-character progress update (starting with your bold speaker tag, e.g., **Cortana:**) after your initial discovery batch so Mano has live visibility before you apply edits.",
   ].join("\n")
 
