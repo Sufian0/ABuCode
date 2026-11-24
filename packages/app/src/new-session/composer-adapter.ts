@@ -29,6 +29,7 @@ const PHASES = { "worktree.create": "worktree", "mcp.prepare": "mcp", "session.c
 
 // Lives in the draft's tab memory, so an attempt outlives the draft screen that the pending tab replaces.
 export function createNewSessionStartStore() {
+  const sessionID = Session.ID.create()
   const [state, setState] = createSignal(createNewSessionStartState())
   // Only one attempt is active at a time, and one that has settled runs no further effects.
   let runner: { attempt: number; run: (effect: NewSessionStartEffect) => Promise<void> } | undefined
@@ -53,6 +54,7 @@ export function createNewSessionStartStore() {
   onCleanup(() => dispatch({ type: "dispose" }))
 
   return {
+    sessionID,
     view: createMemo(() => viewNewSessionStart(state())),
     dispatch,
     // Opens the attempt's runner, which shows the pending tab, only when the machine accepts the start.
@@ -106,7 +108,7 @@ export function createNewSessionComposerAdapter(props: {
       const projectDirectory = props.root()
       const worktree = props.worktree()
       const directory = worktree === "main" ? projectDirectory : worktree
-      const sessionID = Session.ID.create()
+      const sessionID = props.start.sessionID
       const settled = Promise.withResolvers<Started>()
 
       const accepted = props.start.start(

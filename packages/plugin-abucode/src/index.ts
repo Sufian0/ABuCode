@@ -77,6 +77,8 @@ const decodeSquadJson = Schema.decodeUnknownOption(Schema.fromJsonString(ABuCode
 const KEY_DEFAULT_CHARACTER = "global:character"
 const KEY_DEFAULT_POLICY = "global:policy"
 const KEY_DEFAULT_SQUAD = "global:squad"
+const DRAFT_SESSION_PREFIX = "draft:"
+const isDraftSessionID = (sessionID: string) => sessionID === "__draft__" || sessionID.startsWith(DRAFT_SESSION_PREFIX)
 const sessionCharKey = (sessionID: string) => `session:${sessionID}:character`
 const sessionMemKey = (sessionID: string) => `session:${sessionID}:memory`
 const sessionPolicyKey = (sessionID: string) => `session:${sessionID}:policy`
@@ -180,12 +182,15 @@ export default define({
     const getDefaultSquad = () =>
       readStr(KEY_DEFAULT_SQUAD).pipe(Effect.map((raw) => parseSquadJson(raw) ?? DEFAULT_SQUAD_SETTINGS))
 
+    const getDefaultMemory = () => readStr("global:memory").pipe(Effect.map((m) => m ?? ""))
+
     const buildSessionSettings = (sessionID: string) =>
       Effect.gen(function* () {
         const savedChar = yield* readStr(sessionCharKey(sessionID))
         const effectiveChar =
           savedChar !== undefined ? normalizeCharacterChoice(savedChar) : yield* getDefaultCharacter()
-        const memory = (yield* readStr(sessionMemKey(sessionID))) ?? ""
+        const savedMem = yield* readStr(sessionMemKey(sessionID))
+        const memory = savedMem !== undefined ? savedMem : yield* getDefaultMemory()
         const savedPol = yield* readStr(sessionPolicyKey(sessionID))
         const policy = savedPol !== undefined ? normalizePolicyTier(savedPol) : yield* getDefaultPolicy()
         const savedSquad = parseSquadJson(yield* readStr(sessionSquadKey(sessionID)))
@@ -267,7 +272,7 @@ export default define({
           Effect.gen(function* () {
             const norm = normalizeCharacterChoice(input.character)
             yield* writeStr(sessionCharKey(input.sessionID), norm)
-            if (input.saveAsDefault) {
+            if (input.saveAsDefault || isDraftSessionID(input.sessionID)) {
               yield* writeStr(KEY_DEFAULT_CHARACTER, norm)
             }
             const next = yield* buildSessionSettings(input.sessionID)
@@ -280,6 +285,10 @@ export default define({
             const clean = input.memory.trim()
             if (clean) yield* writeStr(sessionMemKey(input.sessionID), clean)
             else yield* removeKey(sessionMemKey(input.sessionID))
+            if (isDraftSessionID(input.sessionID)) {
+              if (clean) yield* writeStr("global:memory", clean)
+              else yield* removeKey("global:memory")
+            }
             const next = yield* buildSessionSettings(input.sessionID)
             yield* emitChanged({ sessionID: input.sessionID, settings: next })
             return next
@@ -294,7 +303,7 @@ export default define({
           Effect.gen(function* () {
             const tier = normalizePolicyTier(input.policy)
             yield* writeStr(sessionPolicyKey(input.sessionID), tier)
-            if (input.saveAsDefault) {
+            if (input.saveAsDefault || isDraftSessionID(input.sessionID)) {
               yield* writeStr(KEY_DEFAULT_POLICY, tier)
             }
             const next = yield* buildSessionSettings(input.sessionID)
@@ -306,7 +315,7 @@ export default define({
           Effect.gen(function* () {
             const norm = normalizeSquadSettings(input.squad)
             yield* writeStr(sessionSquadKey(input.sessionID), JSON.stringify(norm))
-            if (input.saveAsDefault) {
+            if (input.saveAsDefault || isDraftSessionID(input.sessionID)) {
               yield* writeStr(KEY_DEFAULT_SQUAD, JSON.stringify(norm))
             }
             const next = yield* buildSessionSettings(input.sessionID)

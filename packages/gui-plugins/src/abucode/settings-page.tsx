@@ -24,7 +24,7 @@ import {
 } from "./shared"
 
 export interface ABuCodeSettingsProps {
-  readonly onSessionUpdated: (serverID: string, sessionID: string, next: SessionSettings) => void
+  readonly onSessionUpdated: (serverID: string, sessionID: string, next: SessionSettings, savedGlobal?: boolean) => void
 }
 
 const ANTIGRAVITY_THEME_ID = "abucode:antigravity"
@@ -143,21 +143,26 @@ export default function ABuCodeSettingsPage(props: ABuCodeSettingsProps) {
 
   const onSaveSquadSettings = (saveGlobal: boolean) => {
     const cur = activeSession()
+    const srv = activeServer()
 
-    if (!cur) return
+    if (!srv) return
 
-    void cur.server.client
+    const sid = cur?.id ?? "default"
+    const dir = cur?.directory ?? srv.data.project.list()[0]?.canonical
+    const saveAsDefault = saveGlobal || !cur
+
+    void srv.client
       .rpc(ABuCode.Definition)
       .setSquad(
-        { sessionID: cur.id, squad: cloneSquad(squadDraft), saveAsDefault: saveGlobal },
-        { location: { directory: cur.directory } },
+        { sessionID: sid, squad: cloneSquad(squadDraft), saveAsDefault },
+        dir ? { location: { directory: dir } } : undefined,
       )
       .then(
         (next) => {
-          props.onSessionUpdated(cur.server.id, cur.id, next)
+          props.onSessionUpdated(srv.id, sid, next, saveAsDefault)
           showToast({
             variant: "success",
-            title: saveGlobal ? "Saved Squad routing as global default" : "Applied Squad routing to session",
+            title: saveAsDefault ? "Saved Squad routing as global default" : "Applied Squad routing to session",
           })
         },
         (err: Error) => showFailure(err.message),

@@ -1,5 +1,8 @@
 import { createPromptProjectController } from "@/new-session/project/selector"
 import { useNewSessionLocationDialog } from "@/new-session/location/dialog"
+import { createDraftMountedSession } from "@/runtime/plugin/mounted-session"
+import { useComposerLaneAlignment } from "@/session/composer/composer-lane"
+import { SessionPluginPills } from "@/session/composer/plugin-pills"
 import { useTabs, type DraftTab } from "@/shell/tabs/tabs"
 import { useLayout } from "@/shell/state/layout"
 import { useSearchParams } from "@solidjs/router"
@@ -56,6 +59,19 @@ export default function NewSessionPage(props: { draftId: string }) {
 
   const project = createPromptProjectController({ controls: composer.project })
   const location = useNewSessionLocationDialog({ project, workspace, onDone: model.restoreFocus })
+  const alignment = useComposerLaneAlignment()
+
+  const draftDirectory = createMemo(() => {
+    const selected = workspace.selection.value()
+
+    return selected === "main" || selected === "create" ? workspace.project.root() : selected
+  })
+
+  const draftSession = createDraftMountedSession({
+    id: () => start.sessionID,
+    directory: draftDirectory,
+    tab: () => props.draftId,
+  })
 
   useNewSessionCommands({
     restoreFocus: model.restoreFocus,
@@ -100,7 +116,13 @@ export default function NewSessionPage(props: { draftId: string }) {
     <div class="relative size-full overflow-hidden flex flex-col">
       {suspendUntilPromptReady()}
       <div class="flex-1 min-h-0 flex flex-col gap-2 px-[var(--shell-inline-inset,8px)] pb-[var(--shell-bottom-inset,8px)] pt-[var(--shell-top-inset,8px)]">
-        <NewSessionView composer={model} project={project} workspace={workspace} location={location} />
+        <NewSessionView
+          composer={model}
+          project={project}
+          workspace={workspace}
+          location={location}
+          pills={<SessionPluginPills session={draftSession.view()} screen={draftSession.screen} alignment={alignment} />}
+        />
       </div>
     </div>
   )

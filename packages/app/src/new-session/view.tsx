@@ -2,7 +2,7 @@ import { Tooltip } from "@opencode/ui/tooltip"
 import { Icon } from "@opencode/ui/icon"
 import { Keybind } from "@opencode/ui/keybind"
 import { useCommand } from "@/shell/commands/command"
-import { Match, Show, Switch, createComputed, createMemo, createSignal, onCleanup, untrack } from "solid-js"
+import { Match, Show, Switch, createComputed, createMemo, createSignal, onCleanup, untrack, type JSX } from "solid-js"
 import { createStore } from "solid-js/store"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
 import {
@@ -16,6 +16,7 @@ import { Schema } from "effect"
 import { Composer } from "@/composer/composer"
 import { ComposerDropzone } from "@/composer/dropzone"
 import type { ComposerModel } from "@/composer/model"
+import { SessionComposerLane } from "@/session/composer/composer-lane"
 import {
   PromptProjectAddButton,
   type PromptProject,
@@ -58,6 +59,7 @@ export function NewSessionView(props: {
   project: PromptProjectController
   workspace: NewSessionWorkspaceController
   location: ReturnType<typeof useNewSessionLocationDialog>
+  pills?: JSX.Element
 }) {
   const [onboarding, setOnboarding, , onboardingReady] = persisted(
     Persist.global("workspace-onboarding"),
@@ -109,7 +111,10 @@ export function NewSessionView(props: {
               play
               sound={settings.sounds.interfaceEnabled}
             />
-            <div class="mt-8 flex flex-col gap-3">
+            <div class="mt-8 relative flex flex-col gap-3">
+              <Show when={props.pills}>
+                {(pills) => <SessionComposerLane>{pills()}</SessionComposerLane>}
+              </Show>
               <div data-slot="new-session-composer" class="flex flex-col gap-1">
                 <div class="relative z-10">
                   <Composer model={props.composer} />

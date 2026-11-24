@@ -247,6 +247,7 @@ const setup: Plugin.Setup<typeof ABuCodeDefinition> = (ctx) => {
       | {
           characters: readonly CharacterEntry[]
           wildcards: readonly CharacterEntry[]
+          defaultCharacter?: string
           defaultPolicy?: PolicyTier
           defaultSquad?: SquadSettings
         }
@@ -254,25 +255,76 @@ const setup: Plugin.Setup<typeof ABuCodeDefinition> = (ctx) => {
     >
   >({})
 
-  const sessionKey = (serverID: string, sessionID: string) => `${serverID}\u0000${sessionID}`
-  const readSession = (input: ComposerPillProps) => sessions[sessionKey(input.session.server.id, input.session.id)]
+  const formatCharacterLabel = (raw: string | undefined, characters: readonly CharacterEntry[]) => {
+    const clean = (raw ?? "").trim()
 
-  // Sync active session settings, catalog, and tray approval alerts with the ABuCode server plugin over RPC.
+    if (!clean || clean.toLowerCase() === "default" || clean.toLowerCase() === "auto") return ctx.t("defaultCortana")
+
+    if (clean.toLowerCase() === "none") return ctx.t("noCharacter")
+
+    if (clean.toLowerCase() === "random") return ctx.t("randomCharacter")
+
+    const otherMatch = /^(Other(?:10|[1-9]))(?:\s*\{([^}]*)\})?$/i.exec(clean)
+
+    if (otherMatch?.[1]) {
+      const slot = `Other ${/\d+/.exec(otherMatch[1])?.[0] ?? "1"}`
+      const desc = (otherMatch[2] ?? "").trim()
+
+      return desc ? `${slot}: ${desc.slice(0, 28)}${desc.length > 28 ? "…" : ""}` : slot
+    }
+
+    const found = characters.find((item) => item.key.toLowerCase() === clean.toLowerCase())
+
+    return found ? found.display : clean
+  }
+
+  const sessionKey = (serverID: string, sessionID: string) => `${serverID}\u0000${sessionID}`
+
+  const readSession = (input: ComposerPillProps): SessionSettings | undefined => {
+    const serverID = input.session.server.id
+    const stored = sessions[sessionKey(serverID, input.session.id)]
+
+    if (stored) return stored
+
+    const cat = catalogByServer[serverID]
+
+    if (!cat) return undefined
+
+    const character = cat.defaultCharacter ?? "default"
+
+    return {
+      sessionID: input.session.id,
+      character,
+      characterLabel: formatCharacterLabel(character, cat.characters),
+      memory: "",
+      policy: cat.defaultPolicy ?? "default",
+      squad: cat.defaultSquad,
+    }
+  }
+
+  const activeServer = () =>
+    ctx.sessions.current()?.server ??
+    ctx.servers
+      .list()
+      .map((id) => ctx.servers.get(id))
+      .find((item) => item?.connected)
+
+  // Sync catalog, global defaults, and tray approval alerts whenever a server connects (including on New Session).
   createKeyed(
     () => {
-      const current = ctx.sessions.current()
+      const srv = activeServer()
 
-      return current?.server.connected ? `${current.server.id}\u0000${current.id}\u0000${current.directory}` : undefined
+      return srv?.connected ? `${srv.id}\u0000${srv.url}` : undefined
     },
     () => {
-      const current = ctx.sessions.current()
+      const srv = activeServer()
 
-      if (!current) return
+      if (!srv) return
 
-      const serverID = current.server.id
-      const rpc = current.server.client.rpc(ABuCode.Definition)
+      const serverID = srv.id
+      const rpc = srv.client.rpc(ABuCode.Definition)
       const controller = new AbortController()
-      const heard = { value: false }
+      const dir = srv.data.project.list()[0]?.canonical
 
       onCleanup(() => controller.abort())
 
@@ -281,9 +333,24 @@ const setup: Plugin.Setup<typeof ABuCodeDefinition> = (ctx) => {
           "changed",
           (event) => {
             if (event.data.sessionID && event.data.settings) {
-              if (event.data.sessionID === current.id) heard.value = true
-
               setSessions(sessionKey(serverID, event.data.sessionID), event.data.settings)
+            }
+
+            if (
+              event.data.defaultCharacter !== undefined ||
+              event.data.defaultPolicy !== undefined ||
+              event.data.defaultSquad !== undefined
+            ) {
+              const prev = catalogByServer[serverID]
+
+              if (prev) {
+                setCatalogByServer(serverID, {
+                  ...prev,
+                  defaultCharacter: event.data.defaultCharacter ?? prev.defaultCharacter,
+                  defaultPolicy: event.data.defaultPolicy ?? prev.defaultPolicy,
+                  defaultSquad: event.data.defaultSquad ?? prev.defaultSquad,
+                })
+              }
             }
 
             if (event.data.approvalAlert) {
@@ -308,26 +375,14 @@ const setup: Plugin.Setup<typeof ABuCodeDefinition> = (ctx) => {
       )
 
       void rpc
-        .getSession(
-          { sessionID: current.id },
-          { location: { directory: current.directory }, signal: controller.signal },
-        )
+        .catalog({}, dir ? { location: { directory: dir }, signal: controller.signal } : { signal: controller.signal })
         .then(
-          (next) => {
-            if (!controller.signal.aborted && !heard.value) {
-              setSessions(sessionKey(serverID, current.id), next)
-            }
-          },
-          () => undefined,
-        )
-
-      if (!catalogByServer[serverID]) {
-        void rpc.catalog({}, { location: { directory: current.directory }, signal: controller.signal }).then(
           (cat) => {
             if (!controller.signal.aborted) {
               setCatalogByServer(serverID, {
                 characters: cat.characters,
                 wildcards: cat.wildcards,
+                defaultCharacter: cat.defaultCharacter,
                 defaultPolicy: cat.defaultPolicy,
                 defaultSquad: cat.defaultSquad,
               })
@@ -335,6 +390,58 @@ const setup: Plugin.Setup<typeof ABuCodeDefinition> = (ctx) => {
           },
           () => undefined,
         )
+    },
+  )
+
+  // Sync active routed session settings with the ABuCode server plugin over RPC.
+  createKeyed(
+    () => {
+      const current = ctx.sessions.current()
+
+      return current?.server.connected ? `${current.server.id}\u0000${current.id}\u0000${current.directory}` : undefined
+    },
+    () => {
+      const current = ctx.sessions.current()
+
+      if (!current) return
+
+      const serverID = current.server.id
+      const rpc = current.server.client.rpc(ABuCode.Definition)
+      const controller = new AbortController()
+
+      onCleanup(() => controller.abort())
+
+      void rpc
+        .getSession(
+          { sessionID: current.id },
+          { location: { directory: current.directory }, signal: controller.signal },
+        )
+        .then(
+          (next) => {
+            if (!controller.signal.aborted) {
+              setSessions(sessionKey(serverID, current.id), next)
+            }
+          },
+          () => undefined,
+        )
+
+      if (!catalogByServer[serverID]) {
+        void rpc
+          .catalog({}, { location: { directory: current.directory }, signal: controller.signal })
+          .then(
+            (cat) => {
+              if (!controller.signal.aborted) {
+                setCatalogByServer(serverID, {
+                  characters: cat.characters,
+                  wildcards: cat.wildcards,
+                  defaultCharacter: cat.defaultCharacter,
+                  defaultPolicy: cat.defaultPolicy,
+                  defaultSquad: cat.defaultSquad,
+                })
+              }
+            },
+            () => undefined,
+          )
       }
     },
   )
@@ -356,6 +463,13 @@ const setup: Plugin.Setup<typeof ABuCodeDefinition> = (ctx) => {
       .then(
         (next) => {
           setSessions(sessionKey(serverID, sid), next)
+
+          if (saveAsDefault) {
+            const prev = catalogByServer[serverID]
+
+            if (prev) setCatalogByServer(serverID, { ...prev, defaultCharacter: next.character })
+          }
+
           input.close()
         },
         (err: Error) => reportError(err),
@@ -393,6 +507,12 @@ const setup: Plugin.Setup<typeof ABuCodeDefinition> = (ctx) => {
       .then(
         (next) => {
           setSessions(sessionKey(serverID, sid), next)
+
+          if (saveAsDefault && next.squad) {
+            const prev = catalogByServer[serverID]
+
+            if (prev) setCatalogByServer(serverID, { ...prev, defaultSquad: next.squad })
+          }
 
           if (closeAfter) input.close()
         },
@@ -937,7 +1057,15 @@ const setup: Plugin.Setup<typeof ABuCodeDefinition> = (ctx) => {
     render: () => (
       <Suspense>
         <SettingsView
-          onSessionUpdated={(serverID, sessionID, next) => setSessions(sessionKey(serverID, sessionID), next)}
+          onSessionUpdated={(serverID, sessionID, next, savedGlobal) => {
+            setSessions(sessionKey(serverID, sessionID), next)
+
+            if (savedGlobal && next.squad) {
+              const prev = catalogByServer[serverID]
+
+              if (prev) setCatalogByServer(serverID, { ...prev, defaultSquad: next.squad })
+            }
+          }}
         />
       </Suspense>
     ),
