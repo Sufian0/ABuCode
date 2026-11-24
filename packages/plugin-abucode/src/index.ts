@@ -1,3 +1,4 @@
+import path from "node:path"
 import { SystemPart } from "@opencode/ai/effect"
 import { define } from "@opencode/plugin/effect/plugin"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
@@ -9,10 +10,17 @@ import {
   type SquadRoleName,
   type SquadSettings,
 } from "@opencode/schema/abucode"
+import { AbsolutePath } from "@opencode/schema/schema"
 import { Session } from "@opencode/schema/session"
 import { Tool } from "@opencode/schema/tool"
-import { DateTime, Effect, Option, Schema } from "effect"
-import { archiveSessionToChatHistory, type ArchivableTurn } from "./archiver.js"
+import { DateTime, Effect, Option, Schema, Stream } from "effect"
+import {
+  archiveSessionToChatHistory,
+  coalesceSessionMessagesToTurns,
+  isInTempDir,
+  isSessionArchiveUpToDate,
+  removeSessionFromChatHistory,
+} from "./archiver.js"
 import { resolveContentRoot } from "./content-paths.js"
 import {
   composeCharacterSystemPrompt,
@@ -442,72 +450,125 @@ export default define({
       }).pipe(Effect.catchCause(() => Effect.void)),
     )
 
-    const archiveLiveSession = (sessionID: Session.ID) =>
-      Effect.gen(function* () {
-        const info = yield* ctx.session.get({ sessionID })
-        if (info.parentID) return []
-        const rawMessages = yield* ctx.session.context({ sessionID })
-        const settings = yield* buildSessionSettings(sessionID)
-
-        const turns: ArchivableTurn[] = rawMessages.flatMap((msg): ArchivableTurn[] => {
-          if (msg.type === "user") {
-            return [
-              {
-                role: "user",
-                content: msg.text,
-                timestampMs: DateTime.toEpochMillis(msg.time.created),
-              },
-            ]
-          }
-          if (msg.type === "assistant") {
-            const textParts = msg.content.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("\n\n")
-            const thinkParts = msg.content
-              .flatMap((p) => (p.type === "reasoning" ? [p.text] : []))
-              .join("\n\n")
-            if (!textParts.trim() && !thinkParts.trim()) return []
-            return [
-              {
-                role: "assistant",
-                content: textParts,
-                reasoning: thinkParts || undefined,
-                timestampMs: DateTime.toEpochMillis(msg.time.created),
-                provider: String(msg.model.providerID),
-                model: String(msg.model.id),
-                effort: msg.model.variant ? String(msg.model.variant) : undefined,
-                character: settings.characterLabel,
-              },
-            ]
-          }
-          return []
-        })
-
-        if (turns.length === 0) return []
-        return archiveSessionToChatHistory({
-          id: String(info.id),
-          title: info.title ?? "ABuCode Session",
-          createdMs: DateTime.toEpochMillis(info.time.created),
-          updatedMs: DateTime.toEpochMillis(info.time.updated),
-          cwd: ctx.location.directory ?? process.cwd(),
-          character: settings.characterLabel,
-          messages: turns,
-        })
-      }).pipe(Effect.catchCause(() => Effect.succeed([] as string[])))
-
-    yield* ctx.session.hook("experimental.idle", (event) =>
-      Effect.gen(function* () {
-        sessionToolRounds.delete(event.sessionID)
-        sessionToolCeiling.delete(event.sessionID)
-        sessionAgentBudgets.delete(event.sessionID)
-        sessionReportStores.delete(event.sessionID)
-        yield* archiveLiveSession(event.sessionID)
-      }),
-    )
-
-    // --- Security Bodyguards (Shell Env Scrubber, Deep 4-Tier Parser Policy, Secret/Credential & DNS SSRF Guards) ---
+    // --- Security Bodyguards & Turn State ---
     const sessionToolRounds = new Map<string, number>()
     const sessionToolCeiling = new Map<string, number>()
     const DEFAULT_TOOL_ROUND_CEILING = 40
     const EXTRA_TOOL_ROUNDS_STEP = 10
+
+    const clearSessionTurnState = (sessionID: string) => {
+      sessionToolRounds.delete(sessionID)
+      sessionToolCeiling.delete(sessionID)
+      sessionAgentBudgets.delete(sessionID)
+      sessionReportStores.delete(sessionID)
+    }
+
+    const normalizeLocationDir = (dir: string): string => {
+      const resolved = path.resolve(dir)
+      return process.platform === "win32" ? resolved.toLowerCase() : resolved
+    }
+
+    const archiveLiveSession = (sessionID: Session.ID, opts?: { readonly onlyCurrentLocation?: boolean }) =>
+      Effect.gen(function* () {
+        const info = yield* ctx.session.get({ sessionID })
+        if (info.parentID || info.title === "Memory maintenance") return []
+
+        const sessionCwd = info.location?.directory ?? ctx.location.directory ?? process.cwd()
+        if (
+          opts?.onlyCurrentLocation &&
+          ctx.location.directory &&
+          normalizeLocationDir(sessionCwd) !== normalizeLocationDir(ctx.location.directory)
+        ) {
+          return []
+        }
+
+        const rawMessages = yield* ctx.session.context({ sessionID })
+        const settings = yield* buildSessionSettings(sessionID)
+        const turns = coalesceSessionMessagesToTurns(rawMessages, settings.characterLabel, info.outcome)
+        if (turns.length === 0) return []
+
+        const lastTurnMs = turns.at(-1)?.timestampMs ?? 0
+        const updatedMs = Math.max(DateTime.toEpochMillis(info.time.updated), lastTurnMs)
+
+        return archiveSessionToChatHistory({
+          id: String(info.id),
+          title: info.title ?? "ABuCode Session",
+          createdMs: DateTime.toEpochMillis(info.time.created),
+          updatedMs,
+          cwd: sessionCwd,
+          character: settings.characterLabel,
+          messages: turns,
+        })
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("abucode chat archive failed", { sessionID, cause }).pipe(Effect.as([] as string[])),
+        ),
+      )
+
+    yield* ctx.session.hook("experimental.idle", (event) =>
+      Effect.gen(function* () {
+        clearSessionTurnState(event.sessionID)
+        yield* archiveLiveSession(event.sessionID)
+      }),
+    )
+
+    yield* ctx.event
+      .subscribe({
+        types: [
+          "session.inbox.delivered",
+          "session.step.ended",
+          "session.step.failed",
+          "session.execution.succeeded",
+          "session.execution.interrupted",
+          "session.execution.failed",
+          "session.renamed",
+          "session.compaction.ended",
+          "session.revert.committed",
+          "session.deleted",
+        ],
+      })
+      .pipe(
+        Stream.runForEach((event) => {
+          const sid = event.data.sessionID
+          if (event.type === "session.deleted") {
+            return Effect.sync(() => removeSessionFromChatHistory(sid, ctx.location.directory ?? process.cwd()))
+          }
+          if (
+            event.type === "session.execution.succeeded" ||
+            event.type === "session.execution.interrupted" ||
+            event.type === "session.execution.failed"
+          ) {
+            clearSessionTurnState(sid)
+          }
+          return archiveLiveSession(sid, { onlyCurrentLocation: true }).pipe(Effect.asVoid)
+        }),
+        Effect.forkScoped({ startImmediately: true }),
+      )
+
+    if (ctx.location.directory && !isInTempDir(ctx.location.directory)) {
+      const locationDir = ctx.location.directory
+      yield* Effect.gen(function* () {
+        const page = yield* ctx.session.list({
+          directory: AbsolutePath.make(locationDir),
+          parentID: null,
+          order: "desc",
+          limit: 100,
+        })
+        const stale = page.data.filter(
+          (item) =>
+            item.title !== "Memory maintenance" &&
+            !isSessionArchiveUpToDate(
+              item.id,
+              DateTime.toEpochMillis(item.time.updated),
+              item.location?.directory ?? locationDir,
+            ),
+        )
+        yield* Effect.forEach(stale, (item) => archiveLiveSession(item.id), { discard: true })
+      }).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("abucode startup chat archive sweep failed", { cause })),
+        Effect.forkScoped,
+      )
+    }
 
     const notifyApprovalNeeded = (sessionID: string, title: string, detail: string) =>
       emitChanged({
