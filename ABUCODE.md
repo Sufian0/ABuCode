@@ -41,7 +41,7 @@ Every control above the GUI composer (`Character`, `Memory`, `Squad`, `Policy`) 
 | **4-Tier Shell Parser & DNS SSRF Policy** | Composer `Policy` pill + scroll-to-unlock dock | `/policy [request_review \| default \| auto \| turbo]` |
 | **18-Action Headless Browser Play-Tester** | Inline Markdown report + live vision screenshots | `playtest_url` (port reuse, `WxH` viewports, JS dialog/console/network capture) |
 | **Provider `.env.local` Vault & Ping** | `Settings -> ABuCode` | `/keys [status \| test venice \| test nano-gpt \| test poe]` |
-| **GMT+8 Markdown Archiver** | Auto-runs on every idle turn | `/archive` *(force immediate snapshot to `zzz_local/Chat-History`)* |
+| **GMT+8 Markdown Archiver** | Auto-runs on prompt, step, stop/idle, rename & startup backfill | `/archive` *(force immediate snapshot to `zzz_local/Chat-History`)* |
 | **Bubble Colors & Width** | `Settings -> ABuCode` | — |
 | **Desktop `Alt+Space` Summon, Auto-Fallback & Tray Alerts** | `Settings -> ABuCode` + Tray Menu + Hidden Approval Balloons | — |
 
