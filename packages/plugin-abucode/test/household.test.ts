@@ -191,19 +191,24 @@ describe("Household 343, Vanilla Mode & Venice Provider Wiring", () => {
     expect(highVariant?.body).toBeUndefined()
   })
 
-  test("Static workspace architecture map stays deterministic and upgrades snapshot models missing effort variants", () => {
+  test("Static workspace architecture map stays deterministic and expands all monorepo packages + src subdirectories", () => {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "abucode-map-"))
     try {
-      fs.mkdirSync(path.join(tmpRoot, "packages", "app"), { recursive: true })
-      fs.mkdirSync(path.join(tmpRoot, "packages", "gui-plugins"), { recursive: true })
+      for (let i = 1; i <= 32; i++) {
+        fs.mkdirSync(path.join(tmpRoot, "packages", `pkg-${String(i).padStart(2, "0")}`), { recursive: true })
+      }
+      fs.mkdirSync(path.join(tmpRoot, "packages", "app", "src", "new-session"), { recursive: true })
+      fs.mkdirSync(path.join(tmpRoot, "packages", "gui-plugins", "src", "abucode"), { recursive: true })
+      fs.mkdirSync(path.join(tmpRoot, "packages", "ui", "src"), { recursive: true })
       fs.writeFileSync(path.join(tmpRoot, "README.md"), "# Test Repo\n", "utf8")
       const map1 = getStaticRepoMapBlock(tmpRoot)
       const map2 = getStaticRepoMapBlock(tmpRoot)
       expect(map1).toBe(map2)
       expect(map1).toContain("## Workspace Architecture Map")
       expect(map1).toContain("packages/")
-      expect(map1).toContain("app/")
-      expect(map1).toContain("gui-plugins/")
+      expect(map1).toContain("app/ (src: new-session/)")
+      expect(map1).toContain("gui-plugins/ (src: abucode/)")
+      expect(map1).toContain("ui/")
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true })
     }

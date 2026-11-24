@@ -60,6 +60,8 @@ function runSafeGit(repoRoot: string, args: readonly string[], timeoutMs = 2500)
   }
 }
 
+const WORKSPACE_CONTAINER_DIRS = new Set(["packages", "apps", "services", "crates", "libs", "modules"])
+
 export function buildRecursiveRepoTree(
   repoRoot: string,
   opts?: { readonly maxDepth?: number; readonly maxLines?: number },
@@ -68,6 +70,20 @@ export function buildRecursiveRepoTree(
   const maxLines = opts?.maxLines ?? 150
   const treeLines: string[] = []
   const projectFiles: string[] = []
+  const resolvedRoot = path.resolve(repoRoot)
+
+  const listSubdirNames = (dirPath: string, limit = 14): string[] => {
+    try {
+      return fs
+        .readdirSync(dirPath, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && !IGNORED_DIRS.has(e.name))
+        .map((e) => e.name)
+        .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+        .slice(0, limit)
+    } catch {
+      return []
+    }
+  }
 
   const walk = (currDir: string, depth: number, prefix: string) => {
     if (treeLines.length >= maxLines || depth > maxDepth) return
@@ -85,10 +101,38 @@ export function buildRecursiveRepoTree(
     }
 
     const dirName = path.basename(currDir)
-    if (dirName === "zzz_local" && path.resolve(currDir) !== path.resolve(repoRoot)) {
+    const isRoot = path.resolve(currDir) === resolvedRoot
+    if (dirName === "zzz_local" && !isRoot) {
       const subNames = entries.slice(0, 10).map((c) => (c.isDirectory() ? `${c.name}/` : c.name))
       if (subNames.length > 0) {
         treeLines.push(`${prefix}└── ${subNames.join(", ")} (local scratchpad/logs)`)
+      }
+      return
+    }
+
+    // For top-level monorepo workspace containers (`packages/`, `apps/`, `services/`), list every package
+    // along with its immediate `src/` module subdirectories so key packages like `gui-plugins/`, `plugin-abucode/`,
+    // `server/`, `tui/`, and `ui/` are never hidden by alphabetical truncation.
+    if (!isRoot && depth === 2 && WORKSPACE_CONTAINER_DIRS.has(dirName)) {
+      const pkgDirs = entries.filter((c) => c.isDirectory())
+      for (let idx = 0; idx < pkgDirs.length; idx++) {
+        if (treeLines.length >= maxLines) {
+          treeLines.push(`${prefix}... (tree truncated)`)
+          return
+        }
+        const pkg = pkgDirs[idx]!
+        const isLast = idx === pkgDirs.length - 1
+        const sym = isLast ? "└── " : "├── "
+        const pkgPath = path.join(currDir, pkg.name)
+        const srcPath = path.join(pkgPath, "src")
+        const srcSubdirs = listSubdirNames(srcPath, 12)
+        if (srcSubdirs.length > 0) {
+          treeLines.push(`${prefix}${sym}${pkg.name}/ (src: ${srcSubdirs.map((s) => `${s}/`).join(", ")})`)
+        } else {
+          const directSubdirs = listSubdirNames(pkgPath, 8)
+          const suffix = directSubdirs.length > 0 ? ` (${directSubdirs.map((s) => `${s}/`).join(", ")})` : ""
+          treeLines.push(`${prefix}${sym}${pkg.name}/${suffix}`)
+        }
       }
       return
     }
@@ -97,7 +141,7 @@ export function buildRecursiveRepoTree(
       (c) => c.name.startsWith("README.") && c.name.endsWith(".md") && c.name !== "README.md",
     ).length
 
-    if (path.resolve(currDir) !== path.resolve(repoRoot) && (entries.length > 28 || readmeTranslations >= 5)) {
+    if (!isRoot && (entries.length > 28 || readmeTranslations >= 5)) {
       const subdirs = entries
         .filter((c) => c.isDirectory())
         .slice(0, 12)
@@ -168,7 +212,7 @@ export function getStaticRepoMapBlock(repoRoot: string): string {
   }
 
   const repoName = path.basename(resolvedRoot)
-  const { tree } = buildRecursiveRepoTree(resolvedRoot, { maxDepth: 2, maxLines: 75 })
+  const { tree } = buildRecursiveRepoTree(resolvedRoot, { maxDepth: 2, maxLines: 110 })
   if (!tree) {
     staticRepoMapCache.set(resolvedRoot, "")
     return ""

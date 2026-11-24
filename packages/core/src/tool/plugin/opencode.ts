@@ -103,15 +103,14 @@ export const Plugin = {
       Effect.sync(() => {
         const text =
           "execute" in event.tools
-            ? "When you create a worktree outside the current working directory and intend to use it as your primary working directory, consider using `execute` to call `tools.opencode.session.move` and make the worktree the session's working directory."
+            ? "Only if the user explicitly asks to create a new worktree outside the current working directory, you may use `execute` to call `tools.opencode.session.move` to switch to it; otherwise, work directly in the current working directory."
             : "opencode_session_move" in event.tools
-              ? "When you create a worktree outside the current working directory and intend to use it as your primary working directory, consider calling `opencode_session_move` to make the worktree the session's working directory."
+              ? "Only if the user explicitly asks to create a new worktree outside the current working directory, you may call `opencode_session_move` to switch to it; otherwise, work directly in the current working directory."
               : undefined
         if (text) event.system.push(SystemPart.make(text))
       })
     yield* ctx.session.hook("context", hook)
     yield* ctx.session.hook("compaction", hook)
-    yield* ctx.session.hook("generate", hook)
     yield* ctx.tool
       .transform((draft) => {
         draft.namespace({
