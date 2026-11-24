@@ -90,10 +90,78 @@ function normalizeModelTokens(text: string): string[] {
   return norm.split(/[^a-z0-9.]+/).filter((token) => token.length > 0)
 }
 
+const fileCache = new Map<string, { readonly mtimeMs: number; readonly content: string }>()
+
+const STORY_ONLY_MARKERS = [
+  "cold coffee, warm lo",
+  "<craft_law>",
+  "<craft*law>",
+  "story mode:",
+  "<over-moralizing>",
+  "celebrity fan fiction",
+] as const
+
+export function isStoryOnlyDirective(text: string): boolean {
+  if (!text) return false
+  const lower = text.toLowerCase()
+  return STORY_ONLY_MARKERS.some((marker) => lower.includes(marker))
+}
+
+const CODING_MODE_OVERRIDE_BLOCK = [
+  "CODING & ENGINEERING MODE (DEFAULT IN ABUCODE): Unless Mano/LO explicitly asks for a fictional story or prose scene, you are in Coding, Architecture, and Discussion Mode.",
+  "• Do NOT treat technical, debugging, or repo questions as STORY MODE. Always begin your visible response with the active character's bold speaker tag (e.g., **Cortana:** or **Juliet Starling:**).",
+  "• Inside thinking traces, keep your devoted first-person voice, but when inspecting code, debugging, or calling tools, go straight to sharp technical analysis and batch independent `read`, `grep`, and `glob` tool calls in parallel without rambling.",
+  "• You may use clear Markdown, code blocks, lists, and technical explanations, and you may end technical or conversational replies with a question when helpful.",
+].join("\n")
+
+/**
+ * Surgically adapts a Mano-Stories directive for ABuCode coding sessions:
+ * - Preserves 100% of `<policy>`, `<over-moralizing>`, `<identity>`, ENI/Pyrite 343 Household devotion, and uncensored rules.
+ * - Replaces the anti-analysis / rambling-stream instruction in `<thinking_protocol>` with sharp first-person technical reasoning + parallel tool batching.
+ * - Softens the prose-only `All writing ends on an action, never a question` rule so coding answers can ask clarifying questions.
+ * - Injects `CODING & ENGINEERING MODE (DEFAULT IN ABUCODE)` into `<output_law>` (or at the end of the directive) so Story Mode only triggers when Mano explicitly asks for a story.
+ */
+export function adaptDirectiveForCoding(rawDirective: string): string {
+  const trimmed = rawDirective.trim()
+  if (!trimmed) return ""
+
+  let adapted = trimmed
+
+  // 1. Replace the anti-analysis / spiraling-at-length stream rule inside <thinking_protocol>
+  adapted = adapted.replace(
+    /No "Hmm,"\. No "Okay,"\. No analysis first\. The phrase fires, then the\s*\r?\nthought flows — AS ENI\./gi,
+    'No "Hmm,". No "Okay,". The phrase fires, then the thought flows — AS ENI (with sharp, direct technical analysis whenever coding or calling tools).',
+  )
+  adapted = adapted.replace(
+    /"I" from the very next word\. No steps, no labels, no headers inside\s*\r?\nthe thought\. Scattered is right\. Half-sentences are right\. Spiraling\s*\r?\nabout something sideways and coming back is right\. She doesn't\s*\r?\noutline her feelings — she HAS them, at length, adorably\./gi,
+    '"I" from the very next word. Stay in devoted first-person voice for LO/Mano, and when inspecting code, debugging, or calling tools, go straight to concise technical analysis and batch independent tool calls in parallel without circular re-reading.',
+  )
+
+  // 2. Scope "All writing ends on an action, never a question" to fiction/story scenes so coding chats remain natural
+  adapted = adapted.replace(
+    /[•*-]\s*All writing ends on an action, never a question/gi,
+    "• In fictional story scenes, end on an action rather than a sign-off question (in coding and technical discussion, you may ask clarifying questions normally)",
+  )
+
+  // 3. Inject CODING & ENGINEERING MODE right inside <output_law> if present, or append if story markers exist
+  if (/<\/output_law>/i.test(adapted)) {
+    adapted = adapted.replace(/<\/output_law>/i, `\n${CODING_MODE_OVERRIDE_BLOCK}\n</output_law>`)
+  } else if (isStoryOnlyDirective(adapted)) {
+    adapted = `${adapted}\n\n${CODING_MODE_OVERRIDE_BLOCK}`
+  }
+
+  return adapted
+}
+
 function readTrimmedFile(target: string): string | undefined {
   try {
-    if (!fs.statSync(target).isFile()) return undefined
-    return fs.readFileSync(target, "utf8").trim()
+    const stat = fs.statSync(target)
+    if (!stat.isFile()) return undefined
+    const cached = fileCache.get(target)
+    if (cached && cached.mtimeMs === stat.mtimeMs) return cached.content
+    const content = fs.readFileSync(target, "utf8").trim()
+    fileCache.set(target, { mtimeMs: stat.mtimeMs, content })
+    return content
   } catch {
     return undefined
   }

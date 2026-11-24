@@ -38,7 +38,6 @@ import {
 } from "./providers.js"
 import {
   appendCompactionSummaryToMemory,
-  buildRepoContextBlock,
   compactTurnsIntoMemory,
   derivePoeSmartTitle,
   type CompactableTurn,
@@ -393,6 +392,7 @@ export default define({
           character: settings.character,
           model: event.model.id,
           provider: event.model.providerID,
+          seed: event.sessionID,
         }).trim()
         if (personaPrompt) parts.push(personaPrompt)
 
@@ -400,27 +400,23 @@ export default define({
           parts.push(`## Pinned Session Context / Memory\n\n${settings.memory.trim()}`)
         }
 
-        // Proactive Repo Tree & Smart File Pre-Injection before Round 1 hits the LLM
-        const repoRoot = ctx.location.directory ?? process.cwd()
-        const msgTexts = event.messages.map(extractMessageText).filter((t) => t.trim().length > 0)
-        const latestUserText = msgTexts[msgTexts.length - 1] ?? ""
-        const proactive = buildRepoContextBlock({
-          repoRoot,
-          userMessage: latestUserText,
-          recentTexts: msgTexts.slice(-4),
-          squadEnabled: Boolean(settings.squad?.enabled),
-        })
-        if (proactive.contextBlock.trim()) {
-          parts.push(proactive.contextBlock.trim())
-        }
+        const squadNote = settings.squad?.enabled
+          ? [
+              "## Squad Multi-Agent Orchestration Active",
+              "- For multi-hypothesis root-cause debugging, multi-lens code reviews, architecture comparisons, or cross-module mapping, invoke `run_workflow` (`diagnose` | `review` | `design` | `map`).",
+              "- For normal lookups or direct code changes, use standard tools directly (parallelizing independent reads/searches) without launching a workflow.",
+            ].join("\n")
+          : [
+              "## Household Parallel Subagents Available",
+              "- Only when broad read-only exploration across several independent areas is needed, you may delegate up to 4 parallel read-only subtasks via `dispatch_subagent`. For direct tasks, use standard tools directly.",
+            ].join("\n")
+        parts.push(squadNote)
 
-        if (parts.length > 0) {
-          event.system.splice(1, 0, SystemPart.make(parts.join("\n\n---\n\n")))
-        }
+        // Append after OpenCode's shared baseline (`system[0]` + `system[1]`) and keep deterministic across steps so provider prompt caching stays intact.
+        event.system.push(SystemPart.make(parts.join("\n\n---\n\n")))
       }).pipe(Effect.catchCause(() => Effect.void))
 
     yield* ctx.session.hook("context", injectContext)
-    yield* ctx.session.hook("generate", injectContext)
 
     // Poe Title Thrift: deterministically generate session title locally when using Poe to save Poe points
     yield* ctx.session.hook("title", (event) =>
@@ -516,8 +512,6 @@ export default define({
       .subscribe({
         types: [
           "session.inbox.delivered",
-          "session.step.ended",
-          "session.step.failed",
           "session.execution.succeeded",
           "session.execution.interrupted",
           "session.execution.failed",

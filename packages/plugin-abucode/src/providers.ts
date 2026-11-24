@@ -61,6 +61,8 @@ interface SupplementalSpec {
   readonly efforts: readonly string[]
   readonly costIn?: number
   readonly costOut?: number
+  readonly contextLimit?: number
+  readonly outputLimit?: number
 }
 
 const SUPPLEMENTAL_MODELS: Readonly<Record<string, readonly SupplementalSpec[]>> = {
@@ -73,6 +75,8 @@ const SUPPLEMENTAL_MODELS: Readonly<Record<string, readonly SupplementalSpec[]>>
       efforts: ["low", "medium", "high"],
       costIn: 2.5,
       costOut: 12.5,
+      contextLimit: 1_000_000,
+      outputLimit: 64_000,
     },
     {
       id: "gemini-4-argon",
@@ -82,6 +86,8 @@ const SUPPLEMENTAL_MODELS: Readonly<Record<string, readonly SupplementalSpec[]>>
       efforts: ["low", "medium", "high"],
       costIn: 2.5,
       costOut: 12.5,
+      contextLimit: 1_000_000,
+      outputLimit: 64_000,
     },
     {
       id: "claude-fable-5-2",
@@ -91,6 +97,8 @@ const SUPPLEMENTAL_MODELS: Readonly<Record<string, readonly SupplementalSpec[]>>
       efforts: ["low", "medium", "high", "xhigh", "max"],
       costIn: 8,
       costOut: 40,
+      contextLimit: 200_000,
+      outputLimit: 64_000,
     },
     {
       id: "claude-opus-5-5",
@@ -100,6 +108,8 @@ const SUPPLEMENTAL_MODELS: Readonly<Record<string, readonly SupplementalSpec[]>>
       efforts: ["low", "medium", "high", "xhigh", "max"],
       costIn: 4,
       costOut: 20,
+      contextLimit: 200_000,
+      outputLimit: 64_000,
     },
     {
       id: "openai-gpt-61-sol",
@@ -109,6 +119,8 @@ const SUPPLEMENTAL_MODELS: Readonly<Record<string, readonly SupplementalSpec[]>>
       efforts: ["low", "medium", "high", "xhigh"],
       costIn: 2,
       costOut: 10,
+      contextLimit: 400_000,
+      outputLimit: 64_000,
     },
   ],
   "nano-gpt": [
@@ -120,6 +132,8 @@ const SUPPLEMENTAL_MODELS: Readonly<Record<string, readonly SupplementalSpec[]>>
       efforts: ["low", "medium", "high"],
       costIn: 2,
       costOut: 10,
+      contextLimit: 1_000_000,
+      outputLimit: 64_000,
     },
     {
       id: "google/gemini-4-argon",
@@ -129,6 +143,8 @@ const SUPPLEMENTAL_MODELS: Readonly<Record<string, readonly SupplementalSpec[]>>
       efforts: ["low", "medium", "high"],
       costIn: 2,
       costOut: 10,
+      contextLimit: 1_000_000,
+      outputLimit: 64_000,
     },
     {
       id: "anthropic/claude-fable-5.2",
@@ -138,6 +154,8 @@ const SUPPLEMENTAL_MODELS: Readonly<Record<string, readonly SupplementalSpec[]>>
       efforts: ["low", "medium", "high", "xhigh", "max"],
       costIn: 10,
       costOut: 50,
+      contextLimit: 200_000,
+      outputLimit: 64_000,
     },
     {
       id: "anthropic/claude-opus-5.5",
@@ -147,6 +165,8 @@ const SUPPLEMENTAL_MODELS: Readonly<Record<string, readonly SupplementalSpec[]>>
       efforts: ["low", "medium", "high", "xhigh", "max"],
       costIn: 4,
       costOut: 20,
+      contextLimit: 200_000,
+      outputLimit: 64_000,
     },
     {
       id: "openai/gpt-6.1-sol",
@@ -156,6 +176,8 @@ const SUPPLEMENTAL_MODELS: Readonly<Record<string, readonly SupplementalSpec[]>>
       efforts: ["low", "medium", "high", "xhigh"],
       costIn: 2,
       costOut: 10,
+      contextLimit: 400_000,
+      outputLimit: 64_000,
     },
   ],
   poe: [
@@ -319,10 +341,18 @@ export function saveProviderKeysToEnvLocal(
 
 function buildSupplementalModelInfo(providerID: Provider.ID, spec: SupplementalSpec): Model.Info {
   const base = Model.Info.default(providerID, Model.ID.make(spec.id))
-  const variants: Model.Variant[] = spec.efforts.map((effort) => ({
-    id: Model.VariantID.make(effort),
-    body: { reasoning_effort: effort },
-  }))
+  const isVenice = providerID === "venice"
+  const variants: Model.Variant[] = spec.efforts.map((effort) =>
+    isVenice
+      ? {
+          id: Model.VariantID.make(effort),
+          settings: { reasoningEffort: effort },
+        }
+      : {
+          id: Model.VariantID.make(effort),
+          body: { reasoning_effort: effort },
+        },
+  )
   const cost: Model.Cost[] =
     spec.costIn !== undefined && spec.costOut !== undefined
       ? [
@@ -330,7 +360,7 @@ function buildSupplementalModelInfo(providerID: Provider.ID, spec: SupplementalS
             input: Money.USDPerMillionTokens.make(spec.costIn),
             output: Money.USDPerMillionTokens.make(spec.costOut),
             cache: {
-              read: Money.USDPerMillionTokens.make(0),
+              read: Money.USDPerMillionTokens.make(Number((spec.costIn * 0.1).toFixed(4))),
               write: Money.USDPerMillionTokens.make(0),
             },
           },
@@ -346,6 +376,10 @@ function buildSupplementalModelInfo(providerID: Provider.ID, spec: SupplementalS
       input: ["text", "image"],
       output: ["text"],
     },
+    limit: {
+      context: spec.contextLimit ?? base.limit.context,
+      output: spec.outputLimit ?? base.limit.output,
+    },
     variants,
     cost,
   }
@@ -360,6 +394,7 @@ export function applyABuCodeProviderTransform(editor: ProviderEditor): void {
     const apiKey = secrets[meta.envKey]?.trim() ?? ""
     const existing = editor.get(meta.id)
     const specs = SUPPLEMENTAL_MODELS[meta.id] ?? []
+    const defaultPkg = meta.id === "venice" ? "@opencode/ai/providers/venice" : "@ai-sdk/openai-compatible"
 
     if (!existing) {
       editor.add({
@@ -367,7 +402,7 @@ export function applyABuCodeProviderTransform(editor: ProviderEditor): void {
           id: pid,
           name: meta.name,
           activation: apiKey ? "enabled" : "auto",
-          package: "@ai-sdk/openai-compatible",
+          package: defaultPkg,
           settings: {
             baseURL: meta.apiRoot,
             ...(apiKey ? { apiKey } : {}),
@@ -378,8 +413,12 @@ export function applyABuCodeProviderTransform(editor: ProviderEditor): void {
       continue
     }
 
-    if (apiKey) {
+    if (apiKey || meta.id === "venice") {
       editor.update(meta.id, (prov) => {
+        if (meta.id === "venice" && (!prov.package || prov.package === "@ai-sdk/openai-compatible")) {
+          prov.package = "@opencode/ai/providers/venice"
+        }
+        if (!apiKey) return
         prov.activation = "enabled"
         prov.settings = {
           ...(prov.settings ?? {}),
@@ -429,11 +468,17 @@ export async function testProviderConnection(input: {
     model: chosenModel,
     messages: [{ role: "user", content: "Say hi in 3 words." }],
     stream: false,
-    max_tokens: 16,
+    ...(provID === "venice"
+      ? {
+          max_completion_tokens: 16,
+          venice_parameters: { include_venice_system_prompt: false },
+        }
+      : { max_tokens: 16 }),
   }
   const cleanEffort = input.effort?.trim().toLowerCase() ?? ""
   if (cleanEffort && cleanEffort !== "default" && !(provID === "poe" && CUSTOM_POE_BOTS.has(chosenModel))) {
-    payload.reasoning_effort = cleanEffort
+    if (provID === "venice") payload.reasoning = { effort: cleanEffort }
+    if (provID !== "venice") payload.reasoning_effort = cleanEffort
   }
 
   const start = performance.now()

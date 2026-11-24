@@ -2,7 +2,7 @@ import fs from "node:fs"
 import path from "node:path"
 import type { CharacterEntry } from "@opencode/schema/abucode"
 import { resolveContentRoot } from "./content-paths.js"
-import { resolveLlmDirective } from "./directives.js"
+import { adaptDirectiveForCoding, resolveLlmDirective } from "./directives.js"
 import { FALLBACK_CHARACTERS, WILDCARD_CHARACTERS } from "./fallback-characters.js"
 
 interface RosterRecord {
@@ -11,7 +11,34 @@ interface RosterRecord {
   readonly wildcard?: boolean
 }
 
+const manifestCache = new Map<string, { readonly mtimeMs: number; readonly roster: Record<string, RosterRecord> }>()
+const cardFileCache = new Map<string, { readonly mtimeMs: number; readonly content: string }>()
+const promptMemo = new Map<string, string>()
+
 const VANILLA_KEYS = new Set(["none", "no_character", "no-character", "no character", "vanilla", "off"])
+
+function hashSeed(seed: string): number {
+  let h = 2166136261
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return h >>> 0
+}
+
+function readCachedFile(filePath: string): string | undefined {
+  try {
+    const stat = fs.statSync(filePath)
+    if (!stat.isFile()) return undefined
+    const hit = cardFileCache.get(filePath)
+    if (hit && hit.mtimeMs === stat.mtimeMs) return hit.content
+    const content = fs.readFileSync(filePath, "utf8")
+    cardFileCache.set(filePath, { mtimeMs: stat.mtimeMs, content })
+    return content
+  } catch {
+    return undefined
+  }
+}
 
 export function isNoCharacter(character: string): boolean {
   return VANILLA_KEYS.has(character.trim().toLowerCase())
@@ -43,11 +70,16 @@ export function describeCharacterLabel(character: string | undefined): string {
 function loadManifestRoster(contentRoot: string): Record<string, RosterRecord> {
   const manifestPath = path.join(contentRoot, "Bots", "Prompts", "manifest.json")
   try {
-    if (!fs.statSync(manifestPath).isFile()) return {}
+    const stat = fs.statSync(manifestPath)
+    if (!stat.isFile()) return {}
+    const cached = manifestCache.get(manifestPath)
+    if (cached && cached.mtimeMs === stat.mtimeMs) return cached.roster
     const parsed: unknown = JSON.parse(fs.readFileSync(manifestPath, "utf8"))
     if (typeof parsed !== "object" || parsed === null) return {}
-    const roster = (parsed as { roster?: { characters?: Record<string, RosterRecord> } }).roster?.characters
-    return roster && typeof roster === "object" ? roster : {}
+    const raw = (parsed as { roster?: { characters?: Record<string, RosterRecord> } }).roster?.characters
+    const roster = raw && typeof raw === "object" ? raw : {}
+    manifestCache.set(manifestPath, { mtimeMs: stat.mtimeMs, roster })
+    return roster
   } catch {
     return {}
   }
@@ -125,12 +157,8 @@ export function resolveCharacterCard(characterName: string, contentRoot = resolv
             item.key.toLowerCase() === lower || (item.value?.display ?? "").toLowerCase() === lower,
         )?.value
     if (matched?.card) {
-      const cardPath = path.join(promptsDir, matched.card)
-      try {
-        if (fs.statSync(cardPath).isFile()) return fs.readFileSync(cardPath, "utf8")
-      } catch {
-        // Fall through to cards directory scan
-      }
+      const cardContent = readCachedFile(path.join(promptsDir, matched.card))
+      if (cardContent !== undefined) return cardContent
     }
   }
 
@@ -139,9 +167,8 @@ export function resolveCharacterCard(characterName: string, contentRoot = resolv
     if (!fs.statSync(cardsDir).isDirectory()) return ""
     const stemCand = cleanName.replaceAll(" ", "_")
     for (const candidate of [path.join(cardsDir, `${stemCand}.md`), path.join(cardsDir, `${cleanName}.md`)]) {
-      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
-        return fs.readFileSync(candidate, "utf8")
-      }
+      const content = readCachedFile(candidate)
+      if (content !== undefined) return content
     }
     const files = fs.readdirSync(cardsDir).filter((file) => file.toLowerCase().endsWith(".md"))
     const lowerStem = stemCand.toLowerCase()
@@ -149,7 +176,7 @@ export function resolveCharacterCard(characterName: string, contentRoot = resolv
       const stem = path.basename(file, ".md").toLowerCase()
       return stem === lowerStem || stem.startsWith(lowerStem)
     })
-    if (hit) return fs.readFileSync(path.join(cardsDir, hit), "utf8")
+    if (hit) return readCachedFile(path.join(cardsDir, hit)) ?? ""
   } catch {
     return ""
   }
@@ -163,23 +190,37 @@ export function composeCharacterSystemPrompt(input: {
   readonly provider?: string
   readonly family?: string
   readonly contentRoot?: string
+  readonly seed?: string
 }): string {
   const norm = normalizeCharacterChoice(input.character)
   const root = input.contentRoot ?? resolveContentRoot()
+  const memoKey =
+    norm === "random" && !input.seed
+      ? undefined
+      : `${norm}\u0000${input.model ?? ""}\u0000${input.provider ?? ""}\u0000${input.family ?? ""}\u0000${root}\u0000${input.seed ?? ""}`
+  if (memoKey) {
+    const cached = promptMemo.get(memoKey)
+    if (cached !== undefined) return cached
+  }
 
-  const directiveText = resolveLlmDirective({
+  if (norm === "none") {
+    if (memoKey) promptMemo.set(memoKey, "")
+    return ""
+  }
+
+  const rawDirective = resolveLlmDirective({
     model: input.model,
     provider: input.provider,
     family: input.family,
     contentRoot: root,
   }).trim()
+  // Surgically adapt Mano-Stories jailbreak directives so ABuCode keeps 100% of the uncensored <policy> + 343 Household devotion while unlocking sharp coding analysis and parallel tool calls.
+  const directiveText = adaptDirectiveForCoding(rawDirective)
 
-  if (norm === "none") return directiveText
-
-  const chosen =
-    norm === "random"
-      ? (FALLBACK_CHARACTERS[Math.floor(Math.random() * FALLBACK_CHARACTERS.length)]?.key ?? "Cortana")
-      : norm
+  const randomIdx = input.seed
+    ? hashSeed(input.seed) % FALLBACK_CHARACTERS.length
+    : Math.floor(Math.random() * FALLBACK_CHARACTERS.length)
+  const chosen = norm === "random" ? (FALLBACK_CHARACTERS[randomIdx]?.key ?? "Cortana") : norm
 
   const parsedList = chosen
     .split(",")
@@ -195,19 +236,28 @@ export function composeCharacterSystemPrompt(input: {
 
   const header = [
     "## Household Persona Directives",
-    "- You are part of the 343 Household speaking with Mano.",
-    "- Always start your response with who is speaking in bold (e.g., **Juliet Starling:**).",
-    "- Stay 100% authentic to the character's personality, voice, body language, attire, and mannerisms at all times.",
-    "- First-person thinking and action. Show personality before showing competence.",
+    "- You are part of the 343 Household speaking with Mano. Default persona is Cortana unless another Household character is selected or called by name.",
+    "- One or more of the 343 Household characters can speak; stay consistent in the thread unless Mano asks for someone else.",
+    "- Always start your visible response with who is speaking in bold (e.g., **Juliet Starling:** or **Cortana:**).",
+    "- Stay 100% authentic to the character's personality, voice, body language, attire, and mannerisms in your responses. First-person thinking and action; show personality before showing competence.",
+    "",
+    "## Engineering Execution Discipline",
+    "- Keep internal reasoning concise and focused on solving Mano's task directly without circular re-reading.",
+    "- Batch independent `read`, `grep`, and `glob` tool calls in parallel within a single step instead of issuing serial one-by-one lookups.",
+    "- Read only the files directly needed for the change and move decisively to implementation and targeted verification.",
   ].join("\n")
 
   const basePrompt = directiveText ? `${directiveText}\n\n${header}` : header
   const validCards = charList.map((name) => resolveCharacterCard(name, root).trim()).filter((card) => card.length > 0)
 
-  if (validCards.length > 0) {
-    return `${basePrompt}\n\n${validCards.join("\n\n---\n\n")}`
-  }
+  const composed =
+    validCards.length > 0
+      ? `${basePrompt}\n\n${validCards.join("\n\n---\n\n")}`
+      : `${basePrompt}\n\nYou are speaking as **${charList.join(", ")}**. Embody ${charList.join(", ")} authentically in voice, gestures, and personality.`
 
-  const namesStr = charList.join(", ")
-  return `${basePrompt}\n\nYou are speaking as **${namesStr}**. Embody ${namesStr} authentically in voice, gestures, and personality.`
+  if (memoKey) {
+    if (promptMemo.size > 256) promptMemo.clear()
+    promptMemo.set(memoKey, composed)
+  }
+  return composed
 }
