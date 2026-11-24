@@ -431,8 +431,17 @@ export function applyABuCodeProviderTransform(editor: ProviderEditor): void {
     const currentModels = new Map(existing.models)
     let added = false
     for (const spec of specs) {
-      if (!currentModels.has(spec.id)) {
-        currentModels.set(spec.id, buildSupplementalModelInfo(pid, spec))
+      const built = buildSupplementalModelInfo(pid, spec)
+      const prev = currentModels.get(spec.id)
+      if (!prev) {
+        currentModels.set(spec.id, built)
+        added = true
+      } else if (built.variants.length > 0 && prev.variants.length === 0) {
+        currentModels.set(spec.id, {
+          ...prev,
+          name: built.name,
+          variants: built.variants,
+        })
         added = true
       }
     }

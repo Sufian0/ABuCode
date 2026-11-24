@@ -144,6 +144,50 @@ export function buildRecursiveRepoTree(
   return { tree: treeLines.join("\n"), projectFiles }
 }
 
+const staticRepoMapCache = new Map<string, string>()
+
+/**
+ * Builds a deterministic, session-invariant workspace directory map cached per repository root.
+ * Because it never mutates across tool steps or turns, it keeps provider prefix prompt caching at 100%
+ * while giving the model MultiCode-style upfront visibility into the repository's package & folder layout.
+ */
+export function getStaticRepoMapBlock(repoRoot: string): string {
+  const rawRoot = repoRoot.trim()
+  if (!rawRoot) return ""
+  let resolvedRoot: string
+  try {
+    resolvedRoot = path.resolve(rawRoot)
+    const cached = staticRepoMapCache.get(resolvedRoot)
+    if (cached !== undefined) return cached
+    if (!fs.existsSync(resolvedRoot) || !fs.statSync(resolvedRoot).isDirectory()) {
+      staticRepoMapCache.set(resolvedRoot, "")
+      return ""
+    }
+  } catch {
+    return ""
+  }
+
+  const repoName = path.basename(resolvedRoot)
+  const { tree } = buildRecursiveRepoTree(resolvedRoot, { maxDepth: 2, maxLines: 75 })
+  if (!tree) {
+    staticRepoMapCache.set(resolvedRoot, "")
+    return ""
+  }
+
+  const block = [
+    `## Workspace Architecture Map (\`${repoName}/\`)`,
+    "Use this pre-indexed layout to target `read`, `grep`, and `glob` directly to the right package/folder without blind root-wide searches:",
+    "```text",
+    `${repoName}/`,
+    tree,
+    "```",
+  ].join("\n")
+
+  if (staticRepoMapCache.size > 32) staticRepoMapCache.clear()
+  staticRepoMapCache.set(resolvedRoot, block)
+  return block
+}
+
 export function buildRepoContextBlock(input: {
   readonly repoRoot: string
   readonly userMessage: string

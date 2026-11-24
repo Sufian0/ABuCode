@@ -243,8 +243,9 @@ export function composeCharacterSystemPrompt(input: {
     "",
     "## Engineering Execution Discipline",
     "- Keep internal reasoning concise and focused on solving Mano's task directly without circular re-reading.",
-    "- Batch independent `read`, `grep`, and `glob` tool calls in parallel within a single step instead of issuing serial one-by-one lookups.",
-    "- Read only the files directly needed for the change and move decisively to implementation and targeted verification.",
+    "- Batch independent `read`, `grep`, and `glob` tool calls in parallel within a single step (reading 250-500 lines at once rather than tiny slices) instead of issuing serial one-by-one lookups.",
+    "- Cap upfront file exploration to at most 3-4 parallelized tool batches before moving decisively to implementation (`edit` / `write`) and targeted verification. Do not read unrelated plugins, tests, or docs 'just in case.'",
+    "- On multi-step tasks, emit a brief 1-2 sentence in-character progress update (starting with your bold speaker tag, e.g., **Cortana:**) after your initial discovery batch so Mano has live visibility before you apply edits.",
   ].join("\n")
 
   const basePrompt = directiveText ? `${directiveText}\n\n${header}` : header

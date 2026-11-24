@@ -186,8 +186,19 @@ const fromRequest = Effect.fn("VeniceChat.fromRequest")(function* (request: LLMR
         ...(signature === undefined ? {} : { thought_signature: signature }),
         ...(raw === undefined ? {} : { reasoning_content: raw }),
         tool_calls: message.tool_calls?.map((call, index) => {
-          const signature = calls[index]?.providerMetadata?.venice?.thoughtSignature
-          return { ...call, ...(typeof signature === "string" ? { thought_signature: signature } : {}) }
+          const veniceMeta = calls[index]?.providerMetadata?.venice as
+            | {
+                readonly thoughtSignature?: unknown
+                readonly extraContent?: { readonly google?: { readonly thought_signature?: unknown } }
+              }
+            | undefined
+          const signature =
+            typeof veniceMeta?.thoughtSignature === "string"
+              ? veniceMeta.thoughtSignature
+              : typeof veniceMeta?.extraContent?.google?.thought_signature === "string"
+                ? veniceMeta.extraContent.google.thought_signature
+                : undefined
+          return { ...call, ...(signature ? { thought_signature: signature } : {}) }
         }),
       }
     },
@@ -284,11 +295,20 @@ const step = Effect.fn("VeniceChat.step")(function* (state: State, event: typeof
   })
   const tools = { ...state.tools }
   for (const call of delta?.tool_calls ?? []) {
-    if (!call.thought_signature) continue
+    const extraSig =
+      typeof call.extra_content === "object" &&
+      call.extra_content !== null &&
+      "google" in call.extra_content &&
+      typeof (call.extra_content as { readonly google?: { readonly thought_signature?: unknown } }).google
+        ?.thought_signature === "string"
+        ? (call.extra_content as { readonly google: { readonly thought_signature: string } }).google.thought_signature
+        : undefined
+    const sig = call.thought_signature ?? extraSig
+    if (!sig) continue
     const index = call.index ?? result[0].latestToolIndex
     const id =
       call.id ?? (index === undefined ? undefined : (result[0].tools[index]?.id ?? result[0].pendingTools[index]?.id))
-    if (id) tools[id] = call.thought_signature
+    if (id) tools[id] = sig
   }
   return [
     {
