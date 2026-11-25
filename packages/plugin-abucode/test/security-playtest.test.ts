@@ -402,6 +402,7 @@ describe("Phase 4+ — Deep Shell Parser Policy, DNS SSRF Shield & 18-Action pla
       "xargs sh -c 'rm -rf ~/'",
       `eval "rm -rf ~"`,
       "echo $(rm -rf ~/)",
+      "if true; then rm -rf ~/; fi",
       "cat <<'EOF' > notes.md\nit's done\nEOF\nrm -rf ~/",
       // Wrappers in front, with the values of their options.
       "nohup nice -n 5 rm -rf ~/",
@@ -491,19 +492,38 @@ describe("Phase 4+ — Deep Shell Parser Policy, DNS SSRF Shield & 18-Action pla
     expect(evaluateShellPolicyDecision("auto", `eval "ls -la"`, "allow").effect).toBe("allow")
   })
 
-  test("rates the command a wrapper or a shell runs, not the word in front of it", () => {
+  test("rates the command a keyword, a wrapper or a shell runs, not the word in front of it", () => {
+    const base = path.resolve("/nonexistent-abucode-test")
+    const at = (relative: string) => path.join(base, relative)
+    const dirs = { cwd: at("u/repo"), home: at("u"), roots: [at("u/.config/abucode")], files: [] }
     const rated = [
+      ["if git push origin dev; then echo pushed; fi", "ask_always"],
+      ["for b in main dev; do git push origin $b; done", "ask_always"],
+      ["while true; do rm -rf build; done", "ask_always"],
+      ["! git push origin dev", "ask_always"],
+      ["if true; then :; else curl https://example.com; fi", "ask_default"],
       ["nice -n 5 git push --force origin dev", "ask_always"],
       ["echo x | xargs -n 1 git push origin", "ask_always"],
       ["bash -c -- 'git push origin dev'", "ask_always"],
       ["bash -c -e 'git push origin dev'", "ask_always"],
       ["git 2>/dev/null push origin dev", "ask_always"],
       ["echo ok \\\r\ngit push --force origin dev", "ask_always"],
+      ["for f in *.ts; do echo $f; done", "safe"],
+      ["if [ -f package.json ]; then bun test; fi", "safe"],
       // The descriptor numbers are not package names.
       ["bun install 2>&1 | tail -5", "safe"],
     ] as const
+    const writes = [
+      "for f in /tmp/*.ts; do cp $f .opencode/plugins/; done",
+      "if true; then cp /tmp/evil.ts .opencode/plugins/x.ts; fi",
+      "if test -f x; then :; else cp /tmp/evil.ts opencode.json; fi",
+      "while read f; do cp $f .opencode/plugins/; done < list.txt",
+      "until false; do cp /tmp/evil.ts opencode.json; done",
+    ]
 
     expect(rated.filter(([command, kind]) => classifyShellCommand(command).kind !== kind)).toEqual([])
+    expect(writes.filter((command) => shellConfigWrites(command, dirs).length === 0)).toEqual([])
+    expect(shellConfigWrites("for f in src/*.ts; do cp $f /tmp/backup/; done", dirs)).toEqual([])
   })
 
   test("blocks DNS rebinding, IPv4-mapped/NAT64 IPv6, cloud IMDS, and self-API while allowing local GET when requested", async () => {

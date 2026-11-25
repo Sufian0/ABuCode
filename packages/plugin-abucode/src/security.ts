@@ -595,6 +595,8 @@ const SHELL_WRAPPERS = new Set([
   "noglob",
   "nocorrect",
 ])
+// The keywords in front of a command inside `if`, `while`, `until` and `for`: `if cmd; then cmd; else cmd; fi`, `! cmd`.
+const SHELL_KEYWORDS = new Set(["if", "then", "elif", "else", "while", "until", "do", "!"])
 
 function stripLeadingEnvAndWrappers(tokens: readonly string[]): {
   readonly envVars: ReadonlyArray<{ readonly key: string; readonly value: string }>
@@ -639,7 +641,7 @@ function stripLeadingEnvAndWrappers(tokens: readonly string[]): {
       if (idx < tokens.length) idx++ // duration arg
       continue
     }
-    if (SHELL_WRAPPERS.has(base)) {
+    if (SHELL_WRAPPERS.has(base) || SHELL_KEYWORDS.has(base)) {
       idx++
       while (idx < tokens.length && tokens[idx]!.startsWith("-")) idx += step(tokens[idx]!)
       continue
