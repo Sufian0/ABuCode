@@ -4,6 +4,7 @@ import fs from "node:fs"
 import net from "node:net"
 import path from "node:path"
 import type { PolicyTier } from "@opencode/schema/abucode"
+import { FSUtil } from "@opencode/util/fs-util"
 import { loadResolvedSecretEnv, PROVIDERS_META } from "./providers.js"
 
 export const AGENT_SELF_HEADER = "X-ABuCode-Agent"
@@ -146,6 +147,81 @@ export function secretFileAccessReason(
     return `\`${base}\` is a sensitive credential/key file, so ABuCode's read and search tools cannot expose its contents.`
   }
   return undefined
+}
+
+export interface EngineConfigDirs {
+  /** The folder a relative permission resource is relative to: the session's Location directory. */
+  readonly cwd: string
+  /** The user's home folder; the Plan agent writes its plans in `<home>/.opencode/plan`. */
+  readonly home: string
+  /** Folders whose whole content is config: the global and system config folders. */
+  readonly roots: readonly string[]
+  /** Config files outside those folders, such as the one `OPENCODE_CONFIG` names. */
+  readonly files: readonly string[]
+}
+
+/**
+ * Whether an edit permission resource (relative to `cwd` inside the project, absolute outside it) is engine config: a
+ * file named `opencode.json(c)`, anything in a `.opencode` folder, anything in a config root, or a named config file.
+ * Config can load plugins, start MCP servers and replace commands, so editing it can switch the guards off.
+ */
+export function isEngineConfigPath(resource: string, dirs: EngineConfigDirs): boolean {
+  const absolute = path.resolve(dirs.cwd, resource)
+  const real = realPathOf(absolute)
+  const plan = path.join(dirs.home, ".opencode", "plan")
+  const realPlan = realPathOf(plan)
+  // The engine does not load the Plan agent's plan folder, so only what lies below it counts there: an opencode.json or
+  // a .opencode folder inside it is live config for a session moved into the folder.
+  if (containsPath(plan, absolute) && containsPath(realPlan, real)) {
+    return isConfigName(path.relative(foldPath(realPlan), foldPath(real)))
+  }
+  // The path as written and its real path: a link, a macOS firmlink such as /System/Volumes/Data, or another spelling
+  // of a folder that exists reaches the same files the engine loads.
+  return [absolute, real].some(
+    (candidate) =>
+      isConfigName(candidate) ||
+      dirs.roots.some((root) => containsPath(realPathOf(path.resolve(root)), candidate)) ||
+      dirs.files.some((file) => foldPath(realPathOf(path.resolve(file))) === foldPath(candidate)),
+  )
+}
+
+/** Core's ConfigDiscovery.systemDirectory, which plugins cannot import; abucode-config-edit.test.ts compares the two. */
+export function systemConfigDirectory(platform = process.platform, env = process.env) {
+  if (platform === "darwin") return "/Library/Application Support/opencode"
+  if (platform === "win32") return path.join(env.ProgramData || "C:\\ProgramData", "opencode")
+  return "/etc/opencode"
+}
+
+// A file named opencode.json(c), or anything in a .opencode folder. Windows ignores an NTFS stream suffix (`:...`) and
+// trailing dots and spaces in a name, so they are dropped from every segment.
+function isConfigName(value: string): boolean {
+  const segments = foldPath(value)
+    .split(/[\\/]/)
+    .map((segment) => segment.replace(/:.*$/, "").replace(/[. ]+$/, ""))
+  const base = segments.at(-1)
+  return base === "opencode.json" || base === "opencode.jsonc" || segments.includes(".opencode")
+}
+
+// The real path of the deepest folder that resolves, with the rest of the path as written. realpath fails for a missing
+// path and also for a folder that can be searched but not read; that part then stays as written.
+function realPathOf(absolute: string): string {
+  try {
+    return fs.realpathSync.native(absolute)
+  } catch {
+    const parent = path.dirname(absolute)
+    if (parent === absolute) return absolute
+    return path.join(realPathOf(parent), path.basename(absolute))
+  }
+}
+
+// macOS and Windows compare names without case, and APFS folds `ſ` to `s` that way too; APFS also ignores Unicode
+// normalization.
+function foldPath(value: string): string {
+  return value.normalize("NFC").toUpperCase().toLowerCase()
+}
+
+function containsPath(parent: string, child: string): boolean {
+  return FSUtil.contains(foldPath(parent), foldPath(child))
 }
 
 export function knownSecretValues(envLocalPath?: string): string[] {

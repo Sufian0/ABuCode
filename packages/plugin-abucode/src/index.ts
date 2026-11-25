@@ -13,7 +13,8 @@ import {
 import { AbsolutePath } from "@opencode/schema/schema"
 import { Session } from "@opencode/schema/session"
 import { Tool } from "@opencode/schema/tool"
-import { DateTime, Effect, Option, Schema, Stream } from "effect"
+import { Global } from "@opencode/util/global"
+import { Context, DateTime, Effect, Option, Schema, Stream } from "effect"
 import {
   archiveSessionToChatHistory,
   coalesceSessionMessagesToTurns,
@@ -47,10 +48,12 @@ import {
   classifyCatastrophicCommand,
   commandStagesSecretEnvFile,
   evaluateShellPolicyDecision,
+  isEngineConfigPath,
   normalizePolicyTier,
   redactKnownSecrets,
   scrubEnvironmentInPlace,
   secretFileAccessReason,
+  systemConfigDirectory,
   validateResolvedFetchUrlGuard,
 } from "./security.js"
 import {
@@ -115,6 +118,10 @@ interface ChangedPayload {
   readonly defaultSquad?: SquadSettings
   readonly approvalAlert?: ApprovalAlert
 }
+
+// Core's Permission.Unattended, read by its key because plugins cannot import core. It is set while unattended work, such
+// as an automation run, asks for permission. core/test/plugin/abucode-config-edit.test.ts fails if the key stops matching.
+const Unattended = Context.Reference<unknown>("@opencode/Permission/Unattended", { defaultValue: () => undefined })
 
 export default define({
   id: "abucode.core",
@@ -630,6 +637,37 @@ export default define({
           )
         }
       }).pipe(Effect.catchCause(() => Effect.void)),
+    )
+
+    const global = yield* Global.Service
+    const configDirs = {
+      cwd: ctx.location.directory,
+      home: global.home,
+      // The system folder's plugin folder loads like the global one, and on Windows a standard user can usually create it.
+      roots: [global.config, systemConfigDirectory()],
+      files: process.env.OPENCODE_CONFIG ? [process.env.OPENCODE_CONFIG] : [],
+    }
+
+    // The file tools (write, edit, patch, Code Mode's Bun.write, image and video output) ask for `edit` on their target,
+    // so this sees them; shell commands ask for `shell` and are not covered. It asks even where permission rules allow
+    // the edit, and it cannot tell a saved "always" from those rules, so it asks each time.
+    yield* ctx.permission.hook("evaluate", (event) =>
+      Effect.gen(function* () {
+        if (event.action !== "edit" || event.effect === "deny") return
+        const config = event.resources.filter((resource) => isEngineConfigPath(resource, configDirs))
+        if (config.length === 0) return
+        const files =
+          config.length > 3 ? `${config.slice(0, 3).join(", ")} and ${config.length - 3} more` : config.join(", ")
+        // In unattended work core settles an ask from the rules and the work's own grant, which would allow this edit.
+        if ((yield* Unattended) !== undefined) {
+          event.effect = "deny"
+          event.message = `ABuCode refuses edits to engine config in unattended work, where nobody can approve them: ${files}`
+          return
+        }
+        event.effect = "ask"
+        event.message = `ABuCode asks before any edit to engine config, which can load plugins, start MCP servers and replace commands: ${files}`
+        yield* notifyApprovalNeeded(event.sessionID, "⏸ Approve a config edit · ABuCode", event.message)
+      }),
     )
 
     yield* ctx.tool.hook("execute.before", (event) =>
