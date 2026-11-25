@@ -26,7 +26,14 @@ OpenCode turns most of its experimental features on in anything run from source,
 * **The engine reads the flags once, when it starts, and the terminal launcher reuses an engine that is already running.** An engine started any other way, or before the launchers had this list, keeps its own flags. Run `.\abucode.cmd service stop` once after updating, after any `bun run dev`, and before changing flags.
 * **Do not set `OPENCODE_FLAGS` with `service set env`.** A saved value replaces the launcher's list, which turns every feature it does not name back on.
 * **Only the launchers do this.** `bun run dev` and `bun run dev:desktop` carry no list, so an engine they start has the default-on features on. That includes the desktop app on macOS and Linux, which has no launcher. A WSL server added inside the desktop app does not get the list either. `abucode_web.cmd` and `bun run dev:web` start no engine of their own.
-* **After merging a newer OpenCode, or editing a launcher,** run `bun run script/test.ts test/abucode-launchers.test.ts` in `packages/core`. It fails if the release added a feature the launchers do not yet switch off: add it to the list in all four and in the block above.
+* **After merging a newer OpenCode, or editing a launcher,** run `bun run script/test.ts test/abucode-launchers.test.ts test/plugin/abucode-guard.test.ts` in `packages/core`. The first file fails if the release added a feature the launchers do not yet switch off: add it to the list in all four and in the block above. The second fails if the merge dropped the ABuCode plugin from the protected list described in the next section.
+
+## The ABuCode plugin cannot be switched off from config
+
+ABuCode's server plugin, `abucode.core`, enforces the policy tiers and the secret-file and network guards. A `plugins` entry that would remove it (`"-abucode.core"`, `"-abucode.*"` or `"-*"`) is ignored in every config file, your own `~/.config/abucode/opencode.json` included, and the engine does not say that it ignored one. The same plugin carries the personas, memory, archiver and provider vault, so no config entry gives a stock OpenCode run from this checkout.
+
+* **This stops removal entries only.** A repository can still load plugin code of its own from its `.opencode` folder, as OpenCode allows, and code that runs inside the engine is not held by the guards.
+* **The protection is one id added to an upstream line** in `packages/core/src/plugin/internal.ts`, which a merge can drop. The post-merge command above runs the test that catches that.
 
 ## CLI Slash Commands, Agent Tools & GUI Controls
 
