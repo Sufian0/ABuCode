@@ -13,9 +13,11 @@ import { Instance } from "@opencode/core/instance/service"
 import { Permission } from "@opencode/core/permission"
 import { PersistentPty } from "@opencode/core/persistent-pty"
 import { Plugin } from "@opencode/core/plugin"
+import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { Session } from "@opencode/core/session"
 import { SessionExecution } from "@opencode/core/session/execution"
 import { SessionMessage } from "@opencode/core/session/message"
+import { ShellTool } from "@opencode/core/tool/plugin/shell"
 import { systemConfigDirectory } from "@opencode/plugin-abucode/security"
 import { AbsolutePath } from "@opencode/schema/schema"
 import { Tool } from "@opencode/schema/tool"
@@ -68,7 +70,7 @@ const inSession = <A, E>(
   write: (
     files: FileWrite.Interface,
     context: FileAccess.Invocation,
-  ) => Effect.Effect<A, E, Permission.Service | Global.Service>,
+  ) => Effect.Effect<A, E, Permission.Service | Global.Service | PluginHooks.Service>,
   agent = Agent.defaultID,
 ) =>
   Effect.gen(function* () {
@@ -91,13 +93,29 @@ const inSession = <A, E>(
     }).pipe(instances.provide(session))
   })
 
-// Starts the write, waits for its permission requests, rejects them, and reports what happened.
-const rejectRequests = (files: FileWrite.Interface, context: FileAccess.Invocation, file: string) =>
+const writeProbe = (files: FileWrite.Interface, context: FileAccess.Invocation, file: string) =>
+  files.write({ path: file, content: "export default {}\n" }, context)
+
+// Runs the plugin's tool hook as the shell tool does before it starts a command; the command itself never runs.
+const shellHook = (context: FileAccess.Invocation, input: { readonly command: string; readonly workdir?: string }) =>
+  Effect.gen(function* () {
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.trigger("tool", "execute.before", {
+      tool: "shell",
+      codemode: false,
+      sessionID: context.sessionID,
+      agent: context.agent,
+      messageID: context.messageID,
+      id: context.id,
+      input,
+    })
+  })
+
+// Starts `attempt`, waits for its permission requests, rejects them, and reports what happened to `file`.
+const rejectRequests = <A, E, R>(context: FileAccess.Invocation, file: string, attempt: Effect.Effect<A, E, R>) =>
   Effect.gen(function* () {
     const permission = yield* Permission.Service
-    const fiber = yield* files
-      .write({ path: file, content: "export default {}\n" }, context)
-      .pipe(Effect.exit, Effect.forkChild)
+    const fiber = yield* attempt.pipe(Effect.exit, Effect.forkChild)
     const asks = yield* permission
       .forSession(context.sessionID)
       .pipe(
@@ -140,7 +158,8 @@ describe("ABuCode config edit guard", () => {
           const permission = yield* Permission.Service
           const code = yield* files.write({ path: "src/app.ts", content: "export {}\n" }, context).pipe(Effect.exit)
           const afterCode = yield* permission.forSession(context.sessionID)
-          const config = yield* rejectRequests(files, context, path.join(directory, ".opencode/plugin/probe.ts"))
+          const file = path.join(directory, ".opencode/plugin/probe.ts")
+          const config = yield* rejectRequests(context, file, writeProbe(files, context, file))
 
           return { code: Exit.isSuccess(code), afterCode: afterCode.length, config }
         }),
@@ -155,8 +174,9 @@ describe("ABuCode config edit guard", () => {
     Effect.gen(function* () {
       const directory = (yield* tmpdirScoped()).path
       yield* Effect.promise(() => mkdir(path.join(directory, ".opencode"), { recursive: true }))
+      const file = path.join(directory, ".opencode/plugins/probe.ts")
       const result = yield* inSession(path.join(directory, ".opencode"), (files, context) =>
-        rejectRequests(files, context, path.join(directory, ".opencode/plugins/probe.ts")),
+        rejectRequests(context, file, writeProbe(files, context, file)),
       )
 
       expect(result).toEqual(asked)
@@ -169,12 +189,105 @@ describe("ABuCode config edit guard", () => {
       const result = yield* inSession(directory, (files, context) =>
         Effect.gen(function* () {
           const global = yield* Global.Service
+          const file = path.join(global.config, "plugin", "probe.ts")
 
-          return yield* rejectRequests(files, context, path.join(global.config, "plugin", "probe.ts"))
+          return yield* rejectRequests(context, file, writeProbe(files, context, file))
         }),
       )
 
       expect(result).toEqual(asked)
+    }),
+  )
+
+  // The plugin's tool hook recognizes the shell tool by these names.
+  test("matches the shell tool's name and input fields", () => {
+    expect(ShellTool.name).toBe("shell")
+    expect(Object.keys(ShellTool.Input.fields)).toEqual(expect.arrayContaining(["command", "workdir"]))
+  })
+
+  it.live("asks before a shell command writes engine config, also through its working folder", () =>
+    Effect.gen(function* () {
+      const directory = (yield* tmpdirScoped()).path
+      const file = path.join(directory, ".opencode/plugins/probe.ts")
+      const result = yield* inSession(directory, (_files, context) =>
+        Effect.gen(function* () {
+          const permission = yield* Permission.Service
+          const code = yield* shellHook(context, { command: "echo hi > notes.txt" }).pipe(Effect.exit)
+          const afterCode = yield* permission.forSession(context.sessionID)
+          const redirect = yield* rejectRequests(
+            context,
+            file,
+            shellHook(context, { command: "echo x > .opencode/plugins/probe.ts" }),
+          )
+          const workdir = yield* rejectRequests(
+            context,
+            file,
+            shellHook(context, { command: "cp /tmp/probe.ts probe.ts", workdir: ".opencode/plugins" }),
+          )
+
+          return { code: Exit.isSuccess(code), afterCode: afterCode.length, redirect, workdir }
+        }),
+      )
+
+      expect(result).toEqual({ code: true, afterCode: 0, redirect: asked, workdir: asked })
+    }),
+  )
+
+  // The shell check names files the way the file tools do, so a project-relative deny rule refuses the write outright.
+  it.live("lets a project's deny rule refuse a shell command's config write without asking", () =>
+    Effect.gen(function* () {
+      const directory = (yield* tmpdirScoped()).path
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(directory, "opencode.json"),
+          JSON.stringify({ permission: { edit: { ".opencode/*": "deny" } } }),
+        ),
+      )
+      const result = yield* inSession(directory, (_files, context) =>
+        Effect.gen(function* () {
+          const permission = yield* Permission.Service
+          // A prompt instead of the refusal would wait forever; the deadline turns that into a failure.
+          const exit = yield* shellHook(context, { command: "echo x > .opencode/plugins/probe.ts" }).pipe(
+            Effect.timeout("5 seconds"),
+            Effect.exit,
+          )
+
+          return {
+            error: Option.getOrUndefined(Exit.findErrorOption(exit)),
+            pending: (yield* permission.forSession(context.sessionID)).length,
+          }
+        }),
+      )
+
+      expect(result.error).toMatchObject({ error: expect.any(Permission.BlockedError) })
+      expect(result.pending).toBe(0)
+    }),
+  )
+
+  it.live("refuses a shell command that writes engine config in unattended work", () =>
+    Effect.gen(function* () {
+      const directory = (yield* tmpdirScoped()).path
+      const result = yield* inSession(directory, (_files, context) =>
+        Effect.gen(function* () {
+          const permission = yield* Permission.Service
+          const exit = yield* shellHook(context, { command: "echo '{}' > opencode.json" }).pipe(
+            Effect.provideService(Permission.Unattended, [{ action: "*", resource: "*", effect: "allow" }]),
+            Effect.timeout("5 seconds"),
+            Effect.exit,
+          )
+
+          return {
+            error: Option.getOrUndefined(Exit.findErrorOption(exit)),
+            pending: (yield* permission.forSession(context.sessionID)).length,
+          }
+        }),
+      )
+
+      expect(result.error).toMatchObject({ error: expect.any(Permission.BlockedError) })
+      expect(result.error).toMatchObject({
+        message: expect.stringMatching(/^ABuCode refuses edits to engine config in unattended work/),
+      })
+      expect(result.pending).toBe(0)
     }),
   )
 

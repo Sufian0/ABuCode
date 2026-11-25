@@ -2,6 +2,7 @@ import path from "node:path"
 import { SystemPart } from "@opencode/ai/effect"
 import { define } from "@opencode/plugin/effect/plugin"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
+import type { AssertInput } from "@opencode/plugin/permission"
 import {
   ABuCode,
   type ApprovalAlert,
@@ -13,6 +14,7 @@ import {
 import { AbsolutePath } from "@opencode/schema/schema"
 import { Session } from "@opencode/schema/session"
 import { Tool } from "@opencode/schema/tool"
+import { FSUtil } from "@opencode/util/fs-util"
 import { Global } from "@opencode/util/global"
 import { Context, DateTime, Effect, Option, Schema, Stream } from "effect"
 import {
@@ -53,6 +55,7 @@ import {
   redactKnownSecrets,
   scrubEnvironmentInPlace,
   secretFileAccessReason,
+  shellConfigWrites,
   systemConfigDirectory,
   validateResolvedFetchUrlGuard,
 } from "./security.js"
@@ -648,9 +651,30 @@ export default define({
       files: process.env.OPENCODE_CONFIG ? [process.env.OPENCODE_CONFIG] : [],
     }
 
+    // A shell command that visibly writes engine config asks for `edit` on those files, so the hook below asks or refuses
+    // as it does for the file tools. Files are named as the file tools name them, relative inside the working folder, so
+    // project-relative permission rules match them.
+    const assertShellConfigWrites = (
+      command: string,
+      workdir: string | undefined,
+      call: Pick<AssertInput, "sessionID" | "agent" | "source">,
+    ) => {
+      const writes = shellConfigWrites(command, configDirs, { workdir, powershell: process.platform === "win32" })
+      if (writes.length === 0) return Effect.void
+      return ctx.permission.assert({
+        ...call,
+        action: "edit",
+        resources: writes.map((file) => {
+          const named = FSUtil.contains(configDirs.cwd, file) ? path.relative(configDirs.cwd, file) || "." : file
+          return named.replaceAll("\\", "/")
+        }),
+        metadata: { input: workdir === undefined ? { command } : { command, workdir } },
+      })
+    }
+
     // The file tools (write, edit, patch, Code Mode's Bun.write, image and video output) ask for `edit` on their target,
-    // so this sees them; shell commands ask for `shell` and are not covered. It asks even where permission rules allow
-    // the edit, and it cannot tell a saved "always" from those rules, so it asks each time.
+    // and so does the shell check above, so this sees them. It asks even where permission rules allow the edit, and it
+    // cannot tell a saved "always" from those rules, so it asks each time.
     yield* ctx.permission.hook("evaluate", (event) =>
       Effect.gen(function* () {
         if (event.action !== "edit" || event.effect === "deny") return
@@ -689,6 +713,20 @@ export default define({
               if (reason) return yield* Effect.fail(new Tool.Error({ message: reason }))
             }
           }
+        }
+
+        // 1b. Shell commands that write engine config. Only this hook sees the agent's command whole, with its working
+        // folder; the shell's own hook also runs the user's commands and cannot ask.
+        if (event.tool === "shell" && typeof inputObj.command === "string") {
+          yield* assertShellConfigWrites(
+            inputObj.command,
+            typeof inputObj.workdir === "string" ? inputObj.workdir : undefined,
+            {
+              sessionID: event.sessionID,
+              agent: event.agent,
+              source: { type: "tool", messageID: event.messageID, id: event.id },
+            },
+          )
         }
 
         // 2. DNS-resolving SSRF, Cloud Metadata & Self-API shield on webfetch
@@ -759,6 +797,11 @@ export default define({
             if (startCmd) {
               const alreadyOpen = yield* Effect.promise(() => isPlaytestTargetPortOpen(input.url))
               if (!alreadyOpen) {
+                yield* assertShellConfigWrites(startCmd, input.cwd || undefined, {
+                  sessionID: toolCtx.sessionID,
+                  agent: toolCtx.agent,
+                  source: { type: "tool", messageID: toolCtx.messageID, id: toolCtx.id },
+                })
                 const effectiveCwd = input.cwd || (ctx.location.directory ?? process.cwd())
                 const decision = evaluateShellPolicyDecision(settings.policy, startCmd, "allow", effectiveCwd)
                 if (decision.effect === "deny") {

@@ -273,6 +273,9 @@ interface ParsedShellScan {
   readonly segments: readonly (readonly string[])[]
   readonly nestedSnippets: readonly string[]
   readonly redirectionTargets: readonly string[]
+  /** The redirection targets and nested snippets again, each with the index of the segment it belongs to. */
+  readonly redirections: readonly { readonly segment: number; readonly target: string }[]
+  readonly nested: readonly { readonly segment: number; readonly snippet: string }[]
 }
 
 /**
@@ -284,6 +287,12 @@ export function scanShellCommandStructure(rawCommand: string): ParsedShellScan {
   const segments: string[][] = []
   const nestedSnippets: string[] = []
   const redirectionTargets: string[] = []
+  const redirections: { segment: number; target: string }[] = []
+  const nested: { segment: number; snippet: string }[] = []
+  const nest = (snippet: string) => {
+    nestedSnippets.push(snippet)
+    nested.push({ segment: segments.length, snippet })
+  }
   let currentSeg: string[] = []
   let currentTok = ""
   let tokenStarted = false
@@ -382,9 +391,11 @@ export function scanShellCommandStructure(rawCommand: string): ParsedShellScan {
             segments,
             nestedSnippets,
             redirectionTargets,
+            redirections,
+            nested,
           }
         }
-        nestedSnippets.push(sub.inner)
+        nest(sub.inner)
         currentTok += `$(${sub.inner})`
         tokenStarted = true
         i = sub.endIdx
@@ -421,10 +432,12 @@ export function scanShellCommandStructure(rawCommand: string): ParsedShellScan {
           segments,
           nestedSnippets,
           redirectionTargets,
+          redirections,
+          nested,
         }
       }
       const inner = rawCommand.slice(i + 1, endTick)
-      nestedSnippets.push(inner)
+      nest(inner)
       currentTok += `\`${inner}\``
       tokenStarted = true
       i = endTick
@@ -443,7 +456,7 @@ export function scanShellCommandStructure(rawCommand: string): ParsedShellScan {
       if (!sub) {
         ambiguousExpansion = true
       } else {
-        nestedSnippets.push(sub.inner)
+        nest(sub.inner)
         currentTok += `${ch}(${sub.inner})`
         tokenStarted = true
         i = sub.endIdx
@@ -451,23 +464,30 @@ export function scanShellCommandStructure(rawCommand: string): ParsedShellScan {
       }
     }
 
-    // Output redirection > or >>
+    // Output redirection: >, >>, the noclobber overrides >| and >!, and >&file
     if (ch === ">") {
       flushTok()
       if (rawCommand[i + 1] === ">") i++
+      if (rawCommand[i + 1] === "|" || rawCommand[i + 1] === "!") i++
       if (rawCommand[i + 1] === "&") {
         i++
-        continue
+        // `>&2` and `>&-` duplicate or close a descriptor; anything else names a file.
+        if (/[\d-]/.test(rawCommand[i + 1] ?? "")) continue
       }
       let k = i + 1
       while (k < rawCommand.length && (rawCommand[k] === " " || rawCommand[k] === "\t")) k++
       let redirTarget = ""
-      while (k < rawCommand.length && !/[\s|&;<>()]/.test(rawCommand[k]!)) {
-        redirTarget += rawCommand[k]
+      let quote: string | undefined
+      while (k < rawCommand.length && (quote !== undefined || !/[\s|&;<>()]/.test(rawCommand[k]!))) {
+        const c = rawCommand[k]!
+        if (quote === undefined && (c === "'" || c === '"')) quote = c
+        else if (c === quote) quote = undefined
+        else redirTarget += c
         k++
       }
       if (redirTarget && !/^\d+$/.test(redirTarget) && redirTarget !== "/dev/null" && redirTarget.toLowerCase() !== "nul") {
-        redirectionTargets.push(redirTarget.replace(/^["']|["']$/g, ""))
+        redirectionTargets.push(redirTarget)
+        redirections.push({ segment: segments.length, target: redirTarget })
       }
       i = k - 1
       continue
@@ -511,6 +531,8 @@ export function scanShellCommandStructure(rawCommand: string): ParsedShellScan {
     segments,
     nestedSnippets,
     redirectionTargets,
+    redirections,
+    nested,
   }
 }
 
@@ -1034,6 +1056,289 @@ export function evaluateShellPolicyDecision(
     return { effect: "ask", message: `Default policy: ${risk.reason}.` }
   }
   return { effect: baseEffect }
+}
+
+export interface ShellScanOptions {
+  /** The folder the command runs in, as the shell tool's `workdir` gives it; `dirs.cwd` when unset. */
+  readonly workdir?: string
+  /** Also read the command as PowerShell, the default shell on Windows. */
+  readonly powershell?: boolean
+}
+
+/**
+ * The engine config files a shell command visibly writes: output redirection targets, the files given to common
+ * writing commands, files written into a config folder the command works in, and the same inside `sh -c`, `eval` and
+ * `$(...)`, each resolved against the folder its command runs in. A file name built at run time, or a program that
+ * writes files on its own, is not seen.
+ */
+export function shellConfigWrites(command: string, dirs: EngineConfigDirs, options?: ShellScanOptions): string[] {
+  const cwd = options?.workdir === undefined ? dirs.cwd : resolveShellPath(options.workdir, dirs.cwd, dirs.home)
+  const readings = [preparePosix(command), ...(options?.powershell ? [preparePowerShell(command)] : [])]
+  return [...new Set(readings.flatMap((reading) => configWritesIn(reading, cwd, dirs, 0)))]
+}
+
+function configWritesIn(command: string, cwd: string, dirs: EngineConfigDirs, depth: number): string[] {
+  if (depth > 6) return []
+  const scanned = scanShellCommandStructure(command)
+  const commands = scanned.segments.map((segment) => stripLeadingEnvAndWrappers(dropWrapperOptionValues(segment)).argv)
+  // folders[i] is the folder command i runs in: a `cd` changes it for the commands after it.
+  const folders = commands.reduce(
+    (visited, argv) => {
+      const folder = visited.at(-1) ?? cwd
+      const target = changedDirectory(argv)
+      return [...visited, target === undefined ? folder : resolveShellPath(target, folder, dirs.home)]
+    },
+    [cwd],
+  )
+  const folderOf = (segment: number) => folders[segment] ?? folders.at(-1) ?? cwd
+  const written = [
+    ...scanned.redirections.map((item) => resolveShellPath(item.target, folderOf(item.segment), dirs.home)),
+    ...commands.flatMap((argv, index) => {
+      const folder = folderOf(index)
+      return writtenFiles(argv).flatMap((target) => {
+        // Sources land in a destination under their own names only when it is a folder.
+        const into = target.into
+        const folderLike = into === undefined || /(?:^\.\.?|[\\/])$/.test(into)
+        if (into !== undefined && !folderLike && !isDirectory(resolveShellPath(into, folder, dirs.home))) return []
+        return [resolveShellPath(target.file, folder, dirs.home)]
+      })
+    }),
+  ]
+  const nested = [
+    ...scanned.nested.map((item) => ({ snippet: item.snippet, folder: folderOf(item.segment) })),
+    ...commands.flatMap((argv, index) => wrappedCommand(argv).map((snippet) => ({ snippet, folder: folderOf(index) }))),
+  ].flatMap((item) => configWritesIn(item.snippet, item.folder, dirs, depth + 1))
+  return [...written.filter((file) => isEngineConfigPath(file, dirs)), ...nested]
+}
+
+// Heredoc bodies are data, not commands, and `${...}` becomes what it expands to, because the scanner splits at braces.
+function preparePosix(command: string): string {
+  return expandBraceVariables(stripHeredocBodies(command))
+}
+
+// PowerShell reads `\` as a plain path separator, backtick as its escape character and `$env:NAME` as a variable, and a
+// here-string holds data, so the command is rewritten into the shape the POSIX scanner reads.
+function preparePowerShell(command: string): string {
+  return expandBraceVariables(
+    command
+      .replace(/@(['"])\r?\n[\s\S]*?\r?\n\1@/g, "''")
+      .replace(/`\r?\n/g, " ")
+      .replace(/`(.)/g, "$1")
+      .replaceAll("\\", "/")
+      .replace(/\$\{env:([A-Za-z_]\w*)\}|\$env:([A-Za-z_]\w*)/gi, (_, braced, bare) => `$${braced ?? bare}`),
+  )
+}
+
+function stripHeredocBodies(command: string): string {
+  const start: { readonly kept: readonly string[]; readonly until?: string; readonly tabs: boolean } = {
+    kept: [],
+    tabs: false,
+  }
+  return command
+    .split("\n")
+    .reduce((state, line) => {
+      if (state.until !== undefined) {
+        const ended = (state.tabs ? line.replace(/^\t+/, "") : line).replace(/\r$/, "") === state.until
+        return ended ? { kept: state.kept, tabs: false } : state
+      }
+      const marker = /<<(-?)\s*\\?(['"]?)([A-Za-z_][\w.-]*)\2/.exec(line.replaceAll("<<<", "   "))
+      return { kept: [...state.kept, line], until: marker?.[3], tabs: marker?.[1] === "-" }
+    }, start)
+    .kept.join("\n")
+}
+
+// `${NAME}`, `${NAME:-default}` and the like, from the engine's environment. HOME and PWD stay variables, which
+// resolveShellPath reads as the given home and folder.
+function expandBraceVariables(command: string): string {
+  return command.replace(/\$\{([A-Za-z_]\w*)(?:(:?)([-=+?])([^}]*))?\}/g, (_, name, colon, operator, word) => {
+    if (operator === undefined || name === "HOME" || name === "PWD") return `$${name}`
+    const value = process.env[name]
+    const unset = value === undefined || (colon === ":" && value === "")
+    if (operator === "+") return unset ? "" : word
+    return unset && operator !== "?" ? word : (value ?? "")
+  })
+}
+
+function resolveShellPath(token: string, folder: string, home: string): string {
+  return path.resolve(folder, FSUtil.windowsPath(expandShellPath(token, folder, home)))
+}
+
+// A file a command writes. `into` marks a destination that the sources land inside when it is a folder.
+type WrittenFile = { readonly file: string; readonly into?: string }
+
+// The files a command writes, read from its arguments; "." stands for files it writes into the folder it runs in.
+function writtenFiles(argv: readonly string[]): WrittenFile[] {
+  const name = commandName(argv)
+  const args = argv.slice(1)
+  const positional = args.filter((arg) => !arg.startsWith("-"))
+  const files = (list: readonly string[]) => list.map((file) => ({ file }))
+  // Long options also as `--name=value`, and PowerShell parameter names such as `-Destination` in any case.
+  const valuesOf = (flags: readonly string[]) =>
+    args.flatMap((arg, index) => {
+      const long = flags.find((flag) => flag.startsWith("--") && arg.startsWith(`${flag}=`))
+      if (long) return [arg.slice(long.length + 1)]
+      const value = args[index + 1]
+      const named =
+        flags.includes(arg) ||
+        (/^-[a-z]{2,}$/i.test(arg) && flags.some((flag) => flag.toLowerCase() === arg.toLowerCase()))
+      return named && value !== undefined ? [value] : []
+    })
+  if (["tee", "touch", "truncate", "set-content", "sc", "add-content", "ac", "out-file", "tee-object"].includes(name))
+    return files(positional)
+  if (name === "new-item" || name === "ni") {
+    const folder = valuesOf(["-Path"]).at(0)
+    const named = valuesOf(["-Name"]).map((item) => (folder === undefined ? item : path.join(folder, item)))
+    return files([...positional, ...named])
+  }
+  if (["cp", "mv", "install", "ln", "rsync", "copy-item", "cpi", "copy", "move-item", "mi", "move"].includes(name)) {
+    const only = positional.length === 1 ? positional[0] : undefined
+    // A link given only its target is made in the current folder under the target's name.
+    if (name === "ln" && only !== undefined) return files([path.basename(only)])
+    const directory = valuesOf(["-t", "--target-directory", "-Destination"]).at(0)
+    const destination = directory ?? positional.at(-1)
+    if (destination === undefined) return []
+    const operands = directory === undefined ? positional.slice(0, -1) : positional
+    const sources = operands.filter((item) => item !== destination)
+    // A move also changes where its sources were.
+    const moved = ["mv", "move-item", "mi", "move"].includes(name) ? sources : []
+    return [
+      { file: destination },
+      ...sources.map((source) => ({ file: path.join(destination, path.basename(source)), into: destination })),
+      ...files(moved),
+    ]
+  }
+  if (["rename-item", "ren", "rni"].includes(name)) {
+    const source = valuesOf(["-Path", "-LiteralPath"]).at(0) ?? positional[0]
+    const renamed = valuesOf(["-NewName"]).at(0) ?? positional[1]
+    if (source === undefined || renamed === undefined) return []
+    return files([source, path.join(path.dirname(source), renamed)])
+  }
+  if (name === "expand-archive") return files([valuesOf(["-DestinationPath"]).at(0) ?? positional[1] ?? "."])
+  if (name === "sed" || name === "perl") {
+    if (!args.some((arg) => /^-[a-z]*i/i.test(arg) || arg.startsWith("--in-place"))) return []
+    const scripts = new Set(valuesOf(name === "sed" ? ["-e", "--expression", "-f", "--file"] : ["-e", "-E"]))
+    const operands = positional.filter((arg) => !scripts.has(arg))
+    // Without -e or -f the first operand is the script, not a file.
+    return files(scripts.size > 0 ? operands : operands.slice(1))
+  }
+  if (name === "dd") return files(args.filter((arg) => arg.startsWith("of=")).map((arg) => arg.slice(3)))
+  if (name === "curl") {
+    // -O, -J and --remote-name save under the remote file's name in the current folder.
+    const remote = args.some((arg) => /^--remote-name/.test(arg) || /^-[A-Za-z]*[OJ]/.test(arg))
+    return files([...valuesOf(["--output", "--output-dir"]), ...shortValues(args, "o"), ...(remote ? ["."] : [])])
+  }
+  if (name === "wget") {
+    const documents = [...valuesOf(["--output-document"]), ...shortValues(args, "O")].filter((file) => file !== "-")
+    const prefixes = [...valuesOf(["--directory-prefix"]), ...shortValues(args, "P")]
+    const logs = [...valuesOf(["--output-file"]), ...shortValues(args, "o")]
+    const current = documents.length === 0 && prefixes.length === 0 ? ["."] : []
+    return files([...documents, ...prefixes, ...logs, ...current])
+  }
+  if (["invoke-webrequest", "iwr", "invoke-restmethod", "irm"].includes(name)) return files(valuesOf(["-OutFile"]))
+  if (name === "tar") {
+    const directory = valuesOf(["-C", "--directory"])
+    const extracting = args.some(
+      (arg, index) =>
+        arg === "--extract" ||
+        arg === "--get" ||
+        (!arg.startsWith("--") && (index === 0 || arg.startsWith("-")) && /^-?[A-Za-z]*x/.test(arg)),
+    )
+    return files([...directory, ...(extracting && directory.length === 0 ? ["."] : [])])
+  }
+  if (name === "unzip") {
+    const directory = valuesOf(["-d"])
+    const listing = args.some((arg) => /^-[ltvZ]/.test(arg))
+    return files([...directory, ...(directory.length === 0 && !listing ? ["."] : [])])
+  }
+  return []
+}
+
+// A short option that takes a value, also inside a cluster such as `-fsSLo file` or attached as `-ofile`.
+function shortValues(args: readonly string[], letter: string): string[] {
+  return args.flatMap((arg, index) => {
+    const match = arg.startsWith("--") ? null : new RegExp(`^-[A-Za-z]*?${letter}(.*)$`).exec(arg)
+    if (!match) return []
+    const value = match[1] ? match[1] : args[index + 1]
+    return value === undefined ? [] : [value]
+  })
+}
+
+// Options of wrapper commands that take a value, so the value is not read as the command the wrapper runs.
+const WRAPPER_VALUE_OPTIONS: Readonly<Record<string, readonly string[]>> = {
+  sudo: ["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T"],
+  doas: ["-u", "-C"],
+  nice: ["-n"],
+  env: ["-u", "-C", "-S"],
+  timeout: ["-s", "-k"],
+  stdbuf: ["-i", "-o", "-e"],
+  ionice: ["-c", "-n"],
+}
+
+function dropWrapperOptionValues(tokens: readonly string[]): readonly string[] {
+  const head = tokens[0]
+  // `su [user] -c command` runs the command in a shell; its user name would otherwise read as the command.
+  const command = tokens.includes("-c") ? tokens[tokens.indexOf("-c") + 1] : undefined
+  if (head !== undefined && path.basename(head).toLowerCase() === "su" && command !== undefined)
+    return ["sh", "-c", command]
+  const options = head === undefined ? undefined : WRAPPER_VALUE_OPTIONS[path.basename(head).toLowerCase()]
+  if (head === undefined || options === undefined) return tokens
+  const next = tokens[1]
+  if (next !== undefined && options.includes(next)) return dropWrapperOptionValues([head, ...tokens.slice(3)])
+  if (next?.startsWith("-")) return dropWrapperOptionValues([head, ...tokens.slice(2)])
+  return [head, ...dropWrapperOptionValues(tokens.slice(1))]
+}
+
+const XARGS_VALUE_OPTIONS = ["-n", "-L", "-P", "-s", "-I", "-E", "-d", "-a", "--max-args", "--max-procs", "--arg-file"]
+
+// The command a wrapper runs: `sh -c '...'` and other shells' equivalents, `eval '...'`, and `xargs <command>`.
+function wrappedCommand(argv: readonly string[]): string[] {
+  const name = commandName(argv)
+  const rest = argv.slice(1)
+  if (["sh", "bash", "zsh", "dash", "ksh", "fish", "pwsh", "powershell", "cmd"].includes(name)) {
+    const index = rest.findIndex((arg) => /^-(?:[A-Za-z]*c|command)$/i.test(arg) || arg.toLowerCase() === "/c")
+    const inner = index === -1 ? undefined : rest[index + 1]
+    return inner === undefined ? [] : [inner]
+  }
+  if (name === "eval") return [rest.join(" ")]
+  if (name === "xargs") {
+    const index = rest.findIndex((arg, at) => !arg.startsWith("-") && !XARGS_VALUE_OPTIONS.includes(rest[at - 1] ?? ""))
+    return index === -1 ? [] : [rest.slice(index).join(" ")]
+  }
+  return []
+}
+
+// The folder a `cd`-like command changes into; undefined when it changes nothing this scan can follow.
+function changedDirectory(argv: readonly string[]): string | undefined {
+  if (!["cd", "pushd", "chdir", "set-location", "sl", "push-location"].includes(commandName(argv))) return undefined
+  const args = argv.slice(1).filter((arg) => arg.toLowerCase() !== "/d")
+  if (args.includes("-")) return undefined
+  return args.find((arg) => !arg.startsWith("-")) ?? "~"
+}
+
+function commandName(argv: readonly string[]): string {
+  return path
+    .basename(argv[0] ?? "")
+    .replace(/\.(?:exe|cmd|bat|ps1)$/i, "")
+    .toLowerCase()
+}
+
+// `~`, `$HOME`, `$PWD` and other variables from the engine's environment, which the shell inherits.
+function expandShellPath(token: string, folder: string, home: string): string {
+  const tilde = token === "~" || /^~[\\/]/.test(token) ? `${home}${token.slice(1)}` : token
+  return tilde.replace(/\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/g, (match, braced, bare) => {
+    const name = braced ?? bare
+    if (name === "HOME") return home
+    if (name === "PWD") return folder
+    return process.env[name] ?? match
+  })
+}
+
+function isDirectory(file: string): boolean {
+  try {
+    return fs.statSync(file).isDirectory()
+  } catch {
+    return false
+  }
 }
 
 // ============================================================================
