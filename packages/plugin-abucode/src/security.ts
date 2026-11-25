@@ -2,6 +2,7 @@ import childProcess from "node:child_process"
 import dns from "node:dns"
 import fs from "node:fs"
 import net from "node:net"
+import os from "node:os"
 import path from "node:path"
 import type { PolicyTier } from "@opencode/schema/abucode"
 import { FSUtil } from "@opencode/util/fs-util"
@@ -102,9 +103,14 @@ export function isCredentialFile(targetPath: string, opts?: { readonly forWrite?
   if (isEnvStyleSecretFile(base)) return true
 
   // Protect .git internals from mutation and .git/config or .git/hooks from credential/hook tampering
-  if (norm === ".git" || norm.endsWith("/.git") || norm.includes("/.git/")) {
+  if (inGitFolder(norm)) {
     if (opts?.forWrite) return true
-    if (norm.endsWith("/.git/config") || norm.includes("/.git/credentials") || norm.includes("/.git-credentials")) {
+    const rooted = `/${norm}`
+    if (
+      rooted.endsWith("/.git/config") ||
+      rooted.includes("/.git/credentials") ||
+      rooted.includes("/.git-credentials")
+    ) {
       return true
     }
   }
@@ -140,13 +146,19 @@ export function secretFileAccessReason(
       return `\`${base}\` configures provider credentials/routing, so ABuCode's agent tools cannot read or modify it.`
     }
   }
-  if (opts?.mode === "write" && (norm === ".git" || norm.endsWith("/.git") || norm.includes("/.git/"))) {
+  if (opts?.mode === "write" && inGitFolder(norm)) {
     return "Modifying files directly inside `.git/` is blocked for repository safety."
   }
   if (opts?.mode !== "write" && isCredentialFile(targetPath, { forWrite: false })) {
     return `\`${base}\` is a sensitive credential/key file, so ABuCode's read and search tools cannot expose its contents.`
   }
   return undefined
+}
+
+// Whether a lower-cased, forward-slash path names a `.git` folder or lies in one. The file tools pass project-relative
+// paths, so `.git` can be the first segment (`.git/hooks/pre-commit`) as well as a later one.
+function inGitFolder(norm: string) {
+  return `/${norm}/`.includes("/.git/")
 }
 
 export interface EngineConfigDirs {
@@ -362,6 +374,13 @@ export function scanShellCommandStructure(rawCommand: string): ParsedShellScan {
       continue
     }
 
+    // A backslash right before a line feed joins the next line on; it is not a character of any word. Before a CR it
+    // only escapes the CR, so a CRLF line end still ends the command, as in every POSIX shell.
+    if (ch === "\\" && !inSingle && rawCommand[i + 1] === "\n") {
+      i++
+      continue
+    }
+
     if (ch === "\\" && !inSingle) {
       escaped = true
       continue
@@ -464,18 +483,26 @@ export function scanShellCommandStructure(rawCommand: string): ParsedShellScan {
       }
     }
 
-    // Output redirection: >, >>, the noclobber overrides >| and >!, and >&file
+    // Output redirection: >, >>, the noclobber overrides >| and >!, >&file, and zsh's >&| and >&!
     if (ch === ">") {
+      // Bare digits glued to the operator name the descriptor it redirects (`2>&1`, `2>/dev/null`) and are not an
+      // argument, nor is the `<` of `<>`, which opens the target for reading and writing. A word that only ends in
+      // digits, or is quoted or escaped, stays a word (`arg2>f`, `"2">f`, `\<>f`).
+      const glued = /^(?:\d+|\d*<)$/.test(currentTok) && rawCommand.slice(i - currentTok.length, i) === currentTok
+      const before = rawCommand[i - currentTok.length - 1] ?? ""
+      if (glued && (/^[\s;|&()]?$/.test(before) || (currentTok === "<" && before !== "\\"))) {
+        currentTok = ""
+        tokenStarted = false
+      }
       flushTok()
       if (rawCommand[i + 1] === ">") i++
       if (rawCommand[i + 1] === "|" || rawCommand[i + 1] === "!") i++
-      if (rawCommand[i + 1] === "&") {
-        i++
-        // `>&2` and `>&-` duplicate or close a descriptor; anything else names a file.
-        if (/[\d-]/.test(rawCommand[i + 1] ?? "")) continue
-      }
+      const duplicates = rawCommand[i + 1] === "&"
+      if (duplicates) i++
+      if (duplicates && (rawCommand[i + 1] === "|" || rawCommand[i + 1] === "!")) i++
       let k = i + 1
-      while (k < rawCommand.length && (rawCommand[k] === " " || rawCommand[k] === "\t")) k++
+      // Blanks and line continuations may stand between the operator and its target.
+      while (/^(?:[ \t]|\\\n)/.test(rawCommand.slice(k, k + 2))) k += rawCommand[k] === "\\" ? 2 : 1
       let redirTarget = ""
       let quote: string | undefined
       while (k < rawCommand.length && (quote !== undefined || !/[\s|&;<>()]/.test(rawCommand[k]!))) {
@@ -485,7 +512,16 @@ export function scanShellCommandStructure(rawCommand: string): ParsedShellScan {
         else redirTarget += c
         k++
       }
-      if (redirTarget && !/^\d+$/.test(redirTarget) && redirTarget !== "/dev/null" && redirTarget.toLowerCase() !== "nul") {
+      // `>&2` duplicates a descriptor, `>&-` closes one and `>&2-` moves one; anything else names a file. The word
+      // is read either way, so a descriptor is not left behind as an argument.
+      const descriptor = duplicates && /^\d*-?$/.test(redirTarget)
+      if (
+        redirTarget &&
+        !descriptor &&
+        !/^\d+$/.test(redirTarget) &&
+        redirTarget !== "/dev/null" &&
+        redirTarget.toLowerCase() !== "nul"
+      ) {
         redirectionTargets.push(redirTarget)
         redirections.push({ segment: segments.length, target: redirTarget })
       }
@@ -519,6 +555,16 @@ export function scanShellCommandStructure(rawCommand: string): ParsedShellScan {
       continue
     }
 
+    // An unquoted `<` starts a redirection, so it ends the word before it (`b</dev/null`). A descriptor number glued
+    // to it stays on it (`0</dev/null`), as does the rest of the operator (`<<`).
+    if (
+      ch === "<" &&
+      currentTok !== "" &&
+      !currentTok.endsWith("<") &&
+      !(/^\d+$/.test(currentTok) && rawCommand.slice(i - currentTok.length, i) === currentTok)
+    )
+      flushTok()
+
     currentTok += ch
     tokenStarted = true
   }
@@ -536,7 +582,19 @@ export function scanShellCommandStructure(rawCommand: string): ParsedShellScan {
   }
 }
 
-const SHELL_WRAPPERS = new Set(["time", "nohup", "nice", "command", "builtin", "exec"])
+// Words that run the command after them, among them zsh's `noglob` and `nocorrect`.
+const SHELL_WRAPPERS = new Set([
+  "time",
+  "nohup",
+  "nice",
+  "command",
+  "builtin",
+  "exec",
+  "stdbuf",
+  "ionice",
+  "noglob",
+  "nocorrect",
+])
 
 function stripLeadingEnvAndWrappers(tokens: readonly string[]): {
   readonly envVars: ReadonlyArray<{ readonly key: string; readonly value: string }>
@@ -556,10 +614,12 @@ function stripLeadingEnvAndWrappers(tokens: readonly string[]): {
       continue
     }
     const base = path.basename(tok).toLowerCase()
+    // An option that takes a value (`sudo -u root`, `nice -n 5`) is stepped over with its value.
+    const step = (option: string) => (WRAPPER_VALUE_OPTIONS[base]?.includes(option) ? 2 : 1)
     if (base === "sudo" || base === "doas" || base === "runas" || base === "su") {
       usedSudo = true
       idx++
-      while (idx < tokens.length && tokens[idx]!.startsWith("-")) idx++
+      while (idx < tokens.length && tokens[idx]!.startsWith("-")) idx += step(tokens[idx]!)
       continue
     }
     if (base === "env") {
@@ -569,19 +629,19 @@ function stripLeadingEnvAndWrappers(tokens: readonly string[]): {
           const eq = tokens[idx]!.indexOf("=")
           envVars.push({ key: tokens[idx]!.slice(0, eq), value: tokens[idx]!.slice(eq + 1) })
         }
-        idx++
+        idx += step(tokens[idx]!)
       }
       continue
     }
     if (base === "timeout") {
       idx++
-      while (idx < tokens.length && tokens[idx]!.startsWith("-")) idx++
+      while (idx < tokens.length && tokens[idx]!.startsWith("-")) idx += step(tokens[idx]!)
       if (idx < tokens.length) idx++ // duration arg
       continue
     }
     if (SHELL_WRAPPERS.has(base)) {
       idx++
-      while (idx < tokens.length && tokens[idx]!.startsWith("-")) idx++
+      while (idx < tokens.length && tokens[idx]!.startsWith("-")) idx += step(tokens[idx]!)
       continue
     }
     break
@@ -618,7 +678,12 @@ function repoHasUnignoredSecretEnvFiles(cwd?: string): string | undefined {
   return undefined
 }
 
-export function classifyCatastrophicCommand(command: string): string | undefined {
+// `-r` or `-R` alone or in a cluster such as `-rf`, and any long option that starts with `--r`: `--recursive` and the
+// prefixes of it that GNU rm accepts, and options rm refuses anyway.
+const RECURSIVE_FLAG = /^(?:-[a-z]*r[a-z]*|--r[a-z]*)$/i
+
+// `nested` marks text inside a command that was already checked whole; it gets the patterns only.
+export function classifyCatastrophicCommand(command: string, home = os.homedir(), nested = false): string | undefined {
   const norm = command.trim()
   if (!norm) return undefined
 
@@ -638,14 +703,68 @@ export function classifyCatastrophicCommand(command: string): string | undefined
   ) {
     return "Blocked: shutting down or rebooting the host machine is never permitted."
   }
+  // The pattern reads the raw text, so it also catches its spellings inside quotes or a script piped to a shell, and a
+  // mere mention of one. deletesRootOrHome reads the words of each command, the way the shell does.
   if (
     /\brm\s+(?:-[A-Za-z]*r[A-Za-z]*f|-[A-Za-z]*f[A-Za-z]*r|--recursive)\s+(?:--no-preserve-root\s+)?(?:\/(?:\s|$|\*)|~(?:\s|$|\/\*)|\$HOME(?:\s|$|\/\*))/i.test(
       norm,
-    )
+    ) ||
+    (!nested && deletesRootOrHome(norm, home, 0))
   ) {
     return "Blocked: deleting root (/) or home (~) recursively is never permitted."
   }
   return undefined
+}
+
+// A recursive `rm` of the root or home folder in any command, inside `sh -c`, `eval` and `xargs`, and in command
+// substitutions, however its flags and operands are written.
+function deletesRootOrHome(command: string, home: string, depth: number): boolean {
+  if (depth > 6) return false
+  // The body of a quoted heredoc (`<<'EOF'`) is data, such as a commit message. `${HOME}` becomes `$HOME`, and a brace
+  // list one of its words, because the scanner splits at braces: an empty, bare-pattern or `..` word when the list has
+  // one (`~/{x,}`, `~/{*,.*}`, `~/{a/..,b}`), and a harmless word otherwise (`~/.{npm,yarn}`). A list with a quote or a
+  // backslash in it is left alone, so that the quoting around it does not change.
+  const scanned = scanShellCommandStructure(
+    expandBraceVariables(stripHeredocBodies(command, true)).replace(
+      /(?<=[^\s;&|(){}$])\{([^{}\s'"`\\]*)\}/g,
+      (_, list: string) =>
+        list
+          .split(",")
+          .find((item) => list.includes(",") && /^(?:\.{0,2}|\.?[*?]+)$|(?:^|\/)\.\.(?:\/|$)/.test(item)) ?? "_",
+    ),
+  )
+  return (
+    scanned.nestedSnippets.some((snippet) => deletesRootOrHome(snippet, home, depth + 1)) ||
+    scanned.segments.some((segment) => {
+      const argv = stripLeadingEnvAndWrappers(dropWrapperOptionValues(segment)).argv
+      if (commandName(argv) !== "rm")
+        return wrappedCommand(argv).some((inner) => deletesRootOrHome(inner, home, depth + 1))
+      return argv.some((word) => RECURSIVE_FLAG.test(word)) && argv.some((word) => namesRootOrHome(word, home))
+    })
+  )
+}
+
+// The root folder, the home folder or a folder above it, the folders that hold homes, or everything in one of them:
+// trailing segments of only wildcards and punctuation (`~/*`, `/.*`, `~/**`, `~/.[!.]*`, `/*/*`). `~` at the start and
+// `$HOME` anywhere (`/$HOME` is `//Users/x`), in any case as before: an unset `$home` leaves `/` behind. Windows gives
+// the home folder as `C:\Users\x`, and there `/` is the root of the current drive, which need not hold it.
+function namesRootOrHome(word: string, home: string) {
+  const posixHome = home.replaceAll("\\", "/")
+  const expanded = FSUtil.windowsPath(
+    word.replace(/^~(?=\/|$)/, () => posixHome).replace(/\$(?:HOME|\{HOME[^}]*\})(?=\/|$)/gi, () => posixHome),
+  )
+  if (!/^(?:[a-z]:)?\//i.test(expanded)) return false
+  const segments = expanded.split("/")
+  const end = segments.findLastIndex(
+    (segment, index) => index === 0 || (segment !== "" && (/\w/.test(segment) || !segment.includes("*"))),
+  )
+  const folder = path.posix.normalize(segments.slice(0, end + 1).join("/") || "/")
+  return (
+    folder === "/" ||
+    /^[a-z]:$/i.test(folder) ||
+    containsPath(folder, posixHome) ||
+    ["/home", "/users"].includes(foldPath(folder))
+  )
 }
 
 export function commandStagesSecretEnvFile(command: string, cwd?: string): string | undefined {
@@ -757,15 +876,22 @@ function classifySingleSegment(tokens: readonly string[], depth: number): Comman
 
   // Unwrap subshells: bash -c "...", sh -c "...", pwsh -Command "..."
   if (["sh", "bash", "zsh", "dash", "ksh", "pwsh", "powershell", "cmd"].includes(cmd)) {
-    const cIdx = rest.findIndex((t) => /^-(?:[A-Za-z]*c|command)$/i.test(t) || t.toLowerCase() === "/c")
-    if (cIdx !== -1 && rest[cIdx + 1]) {
-      return classifyShellCommand(rest[cIdx + 1]!, undefined, depth + 1)
-    }
+    const line = wrappedCommand(argv)[0]
+    if (line) return classifyShellCommand(line, undefined, depth + 1)
+  }
+
+  // `eval` runs its arguments as one command line. The shell expands variables and substitutions in them first, so
+  // their values run as commands too, and what those are is only known when it runs.
+  if (cmd === "eval") {
+    const line = wrappedCommand(argv)[0] ?? ""
+    const inner = classifyShellCommand(line, undefined, depth + 1)
+    if (inner.kind === "deny" || inner.kind === "ask_always" || !/[$`]/.test(line)) return inner
+    return { kind: "ask_always", reason: "eval runs text that includes variables or command output" }
   }
 
   // Unwrap xargs <subcommand>
   if (cmd === "xargs" && rest.length > 0) {
-    const subIdx = rest.findIndex((t) => !t.startsWith("-"))
+    const subIdx = rest.findIndex((t, at) => !t.startsWith("-") && !XARGS_VALUE_OPTIONS.includes(rest[at - 1] ?? ""))
     if (subIdx !== -1) {
       return classifySingleSegment(rest.slice(subIdx), depth + 1)
     }
@@ -984,7 +1110,9 @@ export function classifyShellCommand(command: string, cwd?: string, depth = 0): 
     return { kind: "ask_always", reason: "deeply nested shell command wrapper" }
   }
 
-  const catastrophic = classifyCatastrophicCommand(command)
+  // The never-permitted list reads the words of the whole command once, at the top, and sees its substitutions and
+  // wrapped commands from there; a substitution found in a quoted heredoc's body below is data.
+  const catastrophic = classifyCatastrophicCommand(command, undefined, depth > 0)
   if (catastrophic) return { kind: "deny", reason: catastrophic }
 
   const envStage = commandStagesSecretEnvFile(command, cwd)
@@ -1080,7 +1208,15 @@ export function shellConfigWrites(command: string, dirs: EngineConfigDirs, optio
 function configWritesIn(command: string, cwd: string, dirs: EngineConfigDirs, depth: number): string[] {
   if (depth > 6) return []
   const scanned = scanShellCommandStructure(command)
-  const commands = scanned.segments.map((segment) => stripLeadingEnvAndWrappers(dropWrapperOptionValues(segment)).argv)
+  // The scanner leaves an input redirection among the words, and it is not one of the command's operands:
+  // `cp a b < /dev/null`, `cp a b 0</dev/null`, `cp a b <<- EOF`. A process substitution `<(...)` is an operand.
+  const commands = scanned.segments
+    .map((segment) =>
+      segment.filter(
+        (word, index) => !/^\d*<+(?!\()/.test(word) && !/^\d*(?:<<-|<+&?)$/.test(segment[index - 1] ?? ""),
+      ),
+    )
+    .map((segment) => stripLeadingEnvAndWrappers(dropWrapperOptionValues(segment)).argv)
   // folders[i] is the folder command i runs in: a `cd` changes it for the commands after it.
   const folders = commands.reduce(
     (visited, argv) => {
@@ -1129,7 +1265,8 @@ function preparePowerShell(command: string): string {
   )
 }
 
-function stripHeredocBodies(command: string): string {
+// `literalOnly` keeps the bodies the shell expands (`<<EOF`), whose command substitutions run.
+function stripHeredocBodies(command: string, literalOnly = false): string {
   const start: { readonly kept: readonly string[]; readonly until?: string; readonly tabs: boolean } = {
     kept: [],
     tabs: false,
@@ -1142,7 +1279,8 @@ function stripHeredocBodies(command: string): string {
         return ended ? { kept: state.kept, tabs: false } : state
       }
       const marker = /<<(-?)\s*\\?(['"]?)([A-Za-z_][\w.-]*)\2/.exec(line.replaceAll("<<<", "   "))
-      return { kept: [...state.kept, line], until: marker?.[3], tabs: marker?.[1] === "-" }
+      const until = literalOnly && !/['"\\]/.test(marker?.[0] ?? "") ? undefined : marker?.[3]
+      return { kept: [...state.kept, line], until, tabs: marker?.[1] === "-" }
     }, start)
     .kept.join("\n")
 }
@@ -1155,6 +1293,8 @@ function expandBraceVariables(command: string): string {
     const value = process.env[name]
     const unset = value === undefined || (colon === ":" && value === "")
     if (operator === "+") return unset ? "" : word
+    // The shell stops at `${NAME:?}` when NAME is unset or empty, so it never stands for an empty word.
+    if (operator === "?" && colon === ":") return unset ? `$${name}` : (value ?? "")
     return unset && operator !== "?" ? word : (value ?? "")
   })
 }
@@ -1269,23 +1409,28 @@ const WRAPPER_VALUE_OPTIONS: Readonly<Record<string, readonly string[]>> = {
   doas: ["-u", "-C"],
   nice: ["-n"],
   env: ["-u", "-C", "-S"],
-  timeout: ["-s", "-k"],
+  timeout: ["-s", "-k", "--signal", "--kill-after"],
   stdbuf: ["-i", "-o", "-e"],
   ionice: ["-c", "-n"],
 }
 
+// A loop, not a recursion: every command the engine starts passes through here, and a long run of wrapper words must
+// neither take seconds nor overflow the stack.
 function dropWrapperOptionValues(tokens: readonly string[]): readonly string[] {
-  const head = tokens[0]
-  // `su [user] -c command` runs the command in a shell; its user name would otherwise read as the command.
-  const command = tokens.includes("-c") ? tokens[tokens.indexOf("-c") + 1] : undefined
-  if (head !== undefined && path.basename(head).toLowerCase() === "su" && command !== undefined)
-    return ["sh", "-c", command]
-  const options = head === undefined ? undefined : WRAPPER_VALUE_OPTIONS[path.basename(head).toLowerCase()]
-  if (head === undefined || options === undefined) return tokens
-  const next = tokens[1]
-  if (next !== undefined && options.includes(next)) return dropWrapperOptionValues([head, ...tokens.slice(3)])
-  if (next?.startsWith("-")) return dropWrapperOptionValues([head, ...tokens.slice(2)])
-  return [head, ...dropWrapperOptionValues(tokens.slice(1))]
+  const kept: string[] = []
+  let at = 0
+  while (at < tokens.length) {
+    const name = path.basename(tokens[at]!).toLowerCase()
+    // `su [user] -c command` runs the command in a shell; its user name would otherwise read as the command.
+    const c = name === "su" ? tokens.indexOf("-c", at) : -1
+    if (c !== -1 && tokens[c + 1] !== undefined) return [...kept, "sh", "-c", tokens[c + 1]!]
+    const options = WRAPPER_VALUE_OPTIONS[name]
+    if (options === undefined) break
+    kept.push(tokens[at]!)
+    at++
+    while (tokens[at]?.startsWith("-")) at += options.includes(tokens[at]!) ? 2 : 1
+  }
+  return [...kept, ...tokens.slice(at)]
 }
 
 const XARGS_VALUE_OPTIONS = ["-n", "-L", "-P", "-s", "-I", "-E", "-d", "-a", "--max-args", "--max-procs", "--arg-file"]
@@ -1296,13 +1441,25 @@ function wrappedCommand(argv: readonly string[]): string[] {
   const rest = argv.slice(1)
   if (["sh", "bash", "zsh", "dash", "ksh", "fish", "pwsh", "powershell", "cmd"].includes(name)) {
     const index = rest.findIndex((arg) => /^-(?:[A-Za-z]*c|command)$/i.test(arg) || arg.toLowerCase() === "/c")
-    const inner = index === -1 ? undefined : rest[index + 1]
+    const after = index === -1 ? [] : rest.slice(index + 1)
+    // A POSIX shell also reads options after -c (`sh -c -e 'text'`, `sh -c -o pipefail 'text'`), and `--` ends them,
+    // so the text is the next word that is not an option. PowerShell and cmd take the next word whatever it is.
+    const start = ["pwsh", "powershell", "cmd"].includes(name)
+      ? 0
+      : after.findIndex(
+          (arg, at) => arg === "--" || (!/^[-+]/.test(arg) && !/^[-+][a-z]*o$/i.test(after[at - 1] ?? "")),
+        )
+    const inner = after[start] === "--" ? after[start + 1] : after[start]
     return inner === undefined ? [] : [inner]
   }
-  if (name === "eval") return [rest.join(" ")]
+  // eval joins its words with spaces, as the shell does; `--` only ends its options.
+  if (name === "eval") return [(rest[0] === "--" ? rest.slice(1) : rest).join(" ")]
   if (name === "xargs") {
     const index = rest.findIndex((arg, at) => !arg.startsWith("-") && !XARGS_VALUE_OPTIONS.includes(rest[at - 1] ?? ""))
-    return index === -1 ? [] : [rest.slice(index).join(" ")]
+    if (index === -1) return []
+    // xargs passes its words on as they are, so each is quoted to stay one word when the command is read again.
+    const quoted = rest.slice(index).map((arg) => `'${arg.replaceAll("'", "'\\''")}'`)
+    return [quoted.join(" ")]
   }
   return []
 }
