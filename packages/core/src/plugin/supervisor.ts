@@ -84,6 +84,17 @@ const resolve = Effect.fn("PluginSupervisor.resolve")(function* (
       enabled.add(retained.id)
       continue
     }
+    // ABuCode: a config package cannot take a guarded built-in's ID, or it would replace the built-in: packages activate
+    // before the `post` built-ins and the first of two equal IDs wins. The failure carries no ID, so it is listed by its
+    // source rather than under the built-in's name.
+    if (PluginInternal.guarded.has(plugin.id)) {
+      failures.set(operation.target, {
+        source: plugin.source ?? PluginModule.source(operation.target),
+        state: { status: "failed", error: `Plugin ID ${plugin.id} is reserved for a built-in plugin` },
+        features: plugin.features ?? { server: true },
+      })
+      continue
+    }
     failures.delete(operation.target)
     const previous = packages.get(operation.target)
     if (previous) enabled.delete(previous.id)
