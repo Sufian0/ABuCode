@@ -2,6 +2,7 @@ import path from "node:path"
 import { SystemPart } from "@opencode/ai/effect"
 import { define } from "@opencode/plugin/effect/plugin"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
+import type { AssertInput } from "@opencode/plugin/permission"
 import {
   ABuCode,
   type ApprovalAlert,
@@ -13,7 +14,9 @@ import {
 import { AbsolutePath } from "@opencode/schema/schema"
 import { Session } from "@opencode/schema/session"
 import { Tool } from "@opencode/schema/tool"
-import { DateTime, Effect, Option, Schema, Stream } from "effect"
+import { FSUtil } from "@opencode/util/fs-util"
+import { Global } from "@opencode/util/global"
+import { Context, DateTime, Effect, Option, Schema, Stream } from "effect"
 import {
   archiveSessionToChatHistory,
   coalesceSessionMessagesToTurns,
@@ -47,10 +50,13 @@ import {
   classifyCatastrophicCommand,
   commandStagesSecretEnvFile,
   evaluateShellPolicyDecision,
+  isEngineConfigPath,
   normalizePolicyTier,
   redactKnownSecrets,
   scrubEnvironmentInPlace,
   secretFileAccessReason,
+  shellConfigWrites,
+  systemConfigDirectory,
   validateResolvedFetchUrlGuard,
 } from "./security.js"
 import {
@@ -115,6 +121,10 @@ interface ChangedPayload {
   readonly defaultSquad?: SquadSettings
   readonly approvalAlert?: ApprovalAlert
 }
+
+// Core's Permission.Unattended, read by its key because plugins cannot import core. It is set while unattended work, such
+// as an automation run, asks for permission. core/test/plugin/abucode-config-edit.test.ts fails if the key stops matching.
+const Unattended = Context.Reference<unknown>("@opencode/Permission/Unattended", { defaultValue: () => undefined })
 
 export default define({
   id: "abucode.core",
@@ -632,6 +642,58 @@ export default define({
       }).pipe(Effect.catchCause(() => Effect.void)),
     )
 
+    const global = yield* Global.Service
+    const configDirs = {
+      cwd: ctx.location.directory,
+      home: global.home,
+      // The system folder's plugin folder loads like the global one, and on Windows a standard user can usually create it.
+      roots: [global.config, systemConfigDirectory()],
+      files: process.env.OPENCODE_CONFIG ? [process.env.OPENCODE_CONFIG] : [],
+    }
+
+    // A shell command that visibly writes engine config asks for `edit` on those files, so the hook below asks or refuses
+    // as it does for the file tools. Files are named as the file tools name them, relative inside the working folder, so
+    // project-relative permission rules match them.
+    const assertShellConfigWrites = (
+      command: string,
+      workdir: string | undefined,
+      call: Pick<AssertInput, "sessionID" | "agent" | "source">,
+    ) => {
+      const writes = shellConfigWrites(command, configDirs, { workdir, powershell: process.platform === "win32" })
+      if (writes.length === 0) return Effect.void
+      return ctx.permission.assert({
+        ...call,
+        action: "edit",
+        resources: writes.map((file) => {
+          const named = FSUtil.contains(configDirs.cwd, file) ? path.relative(configDirs.cwd, file) || "." : file
+          return named.replaceAll("\\", "/")
+        }),
+        metadata: { input: workdir === undefined ? { command } : { command, workdir } },
+      })
+    }
+
+    // The file tools (write, edit, patch, Code Mode's Bun.write, image and video output) ask for `edit` on their target,
+    // and so does the shell check above, so this sees them. It asks even where permission rules allow the edit, and it
+    // cannot tell a saved "always" from those rules, so it asks each time.
+    yield* ctx.permission.hook("evaluate", (event) =>
+      Effect.gen(function* () {
+        if (event.action !== "edit" || event.effect === "deny") return
+        const config = event.resources.filter((resource) => isEngineConfigPath(resource, configDirs))
+        if (config.length === 0) return
+        const files =
+          config.length > 3 ? `${config.slice(0, 3).join(", ")} and ${config.length - 3} more` : config.join(", ")
+        // In unattended work core settles an ask from the rules and the work's own grant, which would allow this edit.
+        if ((yield* Unattended) !== undefined) {
+          event.effect = "deny"
+          event.message = `ABuCode refuses edits to engine config in unattended work, where nobody can approve them: ${files}`
+          return
+        }
+        event.effect = "ask"
+        event.message = `ABuCode asks before any edit to engine config, which can load plugins, start MCP servers and replace commands: ${files}`
+        yield* notifyApprovalNeeded(event.sessionID, "⏸ Approve a config edit · ABuCode", event.message)
+      }),
+    )
+
     yield* ctx.tool.hook("execute.before", (event) =>
       Effect.gen(function* () {
         const inputObj =
@@ -651,6 +713,20 @@ export default define({
               if (reason) return yield* Effect.fail(new Tool.Error({ message: reason }))
             }
           }
+        }
+
+        // 1b. Shell commands that write engine config. Only this hook sees the agent's command whole, with its working
+        // folder; the shell's own hook also runs the user's commands and cannot ask.
+        if (event.tool === "shell" && typeof inputObj.command === "string") {
+          yield* assertShellConfigWrites(
+            inputObj.command,
+            typeof inputObj.workdir === "string" ? inputObj.workdir : undefined,
+            {
+              sessionID: event.sessionID,
+              agent: event.agent,
+              source: { type: "tool", messageID: event.messageID, id: event.id },
+            },
+          )
         }
 
         // 2. DNS-resolving SSRF, Cloud Metadata & Self-API shield on webfetch
@@ -721,6 +797,11 @@ export default define({
             if (startCmd) {
               const alreadyOpen = yield* Effect.promise(() => isPlaytestTargetPortOpen(input.url))
               if (!alreadyOpen) {
+                yield* assertShellConfigWrites(startCmd, input.cwd || undefined, {
+                  sessionID: toolCtx.sessionID,
+                  agent: toolCtx.agent,
+                  source: { type: "tool", messageID: toolCtx.messageID, id: toolCtx.id },
+                })
                 const effectiveCwd = input.cwd || (ctx.location.directory ?? process.cwd())
                 const decision = evaluateShellPolicyDecision(settings.policy, startCmd, "allow", effectiveCwd)
                 if (decision.effect === "deny") {
