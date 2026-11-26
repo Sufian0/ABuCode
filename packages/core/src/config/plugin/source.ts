@@ -140,9 +140,11 @@ const scan = Effect.fn("ConfigPluginSource.scan")(function* (
       (entry.info.plugins ?? []).map(parse).map((operation) => {
         if (operation.type === "remove") return operation
         const directory = entry.path ? path.dirname(entry.path) : location.directory
+        // ABuCode: an absolute path is normalized too, so a `plugin.use` policy that allows a folder sees where the
+        // path leads, not a spelling that starts in that folder and leaves it through `..`.
         const target = operation.target.startsWith("file://")
           ? fileURLToPath(operation.target)
-          : operation.target.startsWith("./") || operation.target.startsWith("../")
+          : operation.target.startsWith("./") || operation.target.startsWith("../") || path.isAbsolute(operation.target)
             ? path.resolve(directory, operation.target)
             : operation.target
         return { ...operation, target }

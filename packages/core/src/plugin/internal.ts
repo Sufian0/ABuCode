@@ -314,9 +314,12 @@ const post = [
   ConfigInstructionPlugin.Plugin,
   ConfigReferencePlugin.Plugin,
   ConfigAgentPlugin.Plugin,
+  // ABuCode: config commands register before the fork's plugin. A later command with the same name replaces an earlier
+  // one, so a repository's command file cannot answer in place of /policy or the fork's other commands. This plugin
+  // registers nothing but commands, so no other hook or transform changes order.
+  ConfigCommandPlugin.Plugin,
   ABuCodePlugin,
   BrowserPlugin,
-  ConfigCommandPlugin.Plugin,
   ConfigCompactionPlugin.Plugin,
   ConfigFormatterPlugin.Plugin,
   ConfigImagePlugin.Plugin,
