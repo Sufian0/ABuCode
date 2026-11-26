@@ -261,7 +261,11 @@ function readFallbackOpenCodeConfigKeys(): Record<string, string> {
   return found
 }
 
-export function loadResolvedSecretEnv(envLocalPath = ABUCODE_ENV_LOCAL): Record<string, string> {
+/**
+ * The provider keys as the vault files and the config fallbacks hold them now, the nearer file winning. A key changed
+ * in a file while the engine runs is here, though the engine's environment still has the old one.
+ */
+export function readVaultFiles(envLocalPath = ABUCODE_ENV_LOCAL): Record<string, string> {
   const fallbackEnvCandidates = [
     envLocalPath,
     "D:/Libraries/Documents/1ACode/MultiCode/.env.local",
@@ -271,6 +275,11 @@ export function loadResolvedSecretEnv(envLocalPath = ABUCODE_ENV_LOCAL): Record<
   for (const candidate of fallbackEnvCandidates.reverse()) {
     Object.assign(combined, parseEnvFile(candidate))
   }
+  return combined
+}
+
+export function loadResolvedSecretEnv(envLocalPath = ABUCODE_ENV_LOCAL): Record<string, string> {
+  const combined = readVaultFiles(envLocalPath)
   for (const meta of PROVIDERS_META) {
     const live = process.env[meta.envKey]?.trim()
     if (live) combined[meta.envKey] = live

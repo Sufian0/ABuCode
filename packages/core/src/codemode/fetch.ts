@@ -16,8 +16,15 @@ type Init = {
   readonly body?: string | Uint8Array<ArrayBuffer> | URLSearchParams
 }
 
-const fetch = (input: string | URL, init: Init = {}) =>
+const fetch = (input: string | URL, options?: Init | null) =>
   Effect.gen(function* () {
+    // ABuCode: only these fields reach the request. Bun's own options, such as `proxy`, `unix` and `s3`, would send it
+    // somewhere the permission check never saw, and a method that is not a string would be shown and checked as GET.
+    const init: Init = {
+      method: options?.method === undefined ? undefined : String(options.method),
+      headers: options?.headers,
+      body: options?.body,
+    }
     // Rules match the URL as written. The fragment is never sent, and would keep a rule for the exact URL from
     // matching.
     const url = String(input).split("#")[0]
@@ -49,11 +56,12 @@ const fetch = (input: string | URL, init: Init = {}) =>
         ),
       )
     // Redirects are followed here so each new URL meets the same deny rules as the webfetch tool's hops.
-    const check = (next: string) =>
+    // ABuCode: each hop is shown with the request that goes there, so a 303 is checked as the GET it becomes.
+    const check = (next: string, hop: Init) =>
       permission.assertNotDenied({
         action: "webfetch",
         resources: [next],
-        metadata: { ...display([next, init]), redirectedFrom: url },
+        metadata: { ...display([next, hop]), redirectedFrom: url },
         sessionID: execution.sessionID,
         agent: execution.agent,
         source,
@@ -78,8 +86,8 @@ const fetch = (input: string | URL, init: Init = {}) =>
       if (next.username || next.password)
         return yield* Effect.fail(new Error("fetch cannot follow a redirect with credentials in the URL."))
       next.hash = ""
-      yield* check(next.href)
       request = redirected(request, response.status, target, next)
+      yield* check(next.href, request)
       target = next.href
     }
   })

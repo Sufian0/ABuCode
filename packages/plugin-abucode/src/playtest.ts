@@ -1,4 +1,5 @@
 import childProcess from "node:child_process"
+import fs from "node:fs"
 import net from "node:net"
 import type { PolicyTier } from "@opencode/schema/abucode"
 import type { Tool } from "@opencode/schema/tool"
@@ -7,6 +8,8 @@ import {
   AGENT_SELF_HEADER,
   evaluateShellPolicyDecision,
   isLoopbackHost,
+  isOwnServerUrl,
+  playtestConnectionAddresses,
   redactKnownSecrets,
   scrubEnvironmentRecord,
   validateFetchUrlGuard,
@@ -100,8 +103,10 @@ export function resolvePlaytestViewport(raw?: string): { readonly width: number;
   return VIEWPORT_PRESETS.desktop!
 }
 
+/** `ownServers` are the engine's own servers (FetchGuardOptions.ownServers), which a play-test may not open. */
 export function validatePlaytestTargetUrl(
   rawUrl: string,
+  ownServers: readonly string[] = [],
 ):
   | { readonly ok: true; readonly url: string; readonly host: string; readonly port: number }
   | { readonly ok: false; readonly error: string } {
@@ -129,7 +134,7 @@ export function validatePlaytestTargetUrl(
       error: `playtest_url only connects to local loopback (localhost, 127.0.0.1, [::1]), got '${host}'.`,
     }
   }
-  const selfApiErr = validateFetchUrlGuard(parsed.toString(), { method: "GET", allowLoopbackGet: true })
+  const selfApiErr = validateFetchUrlGuard(parsed.toString(), { method: "GET", allowLoopbackGet: true, ownServers })
   if (selfApiErr) {
     return { ok: false, error: selfApiErr }
   }
@@ -194,13 +199,16 @@ async function waitForLocalPortReady(
   port: number,
   proc: childProcess.ChildProcess,
   timeoutMs = 18_000,
-): Promise<{ readonly ready: boolean; readonly exitedEarlyCode: number | null }> {
+  spawnError: () => Error | undefined = () => undefined,
+): Promise<{ readonly ready: boolean; readonly exitedEarlyCode: number | null; readonly spawnError?: Error }> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (await checkTcpPortOpen(host, port)) {
       await new Promise((r) => setTimeout(r, 120))
       return { ready: true, exitedEarlyCode: null }
     }
+    const failed = spawnError()
+    if (failed !== undefined) return { ready: false, exitedEarlyCode: null, spawnError: failed }
     if (proc.exitCode !== null) {
       return { ready: false, exitedEarlyCode: proc.exitCode }
     }
@@ -209,13 +217,28 @@ async function waitForLocalPortReady(
   return { ready: false, exitedEarlyCode: proc.exitCode }
 }
 
-async function launchChromiumResilient() {
+/** Why start_command cannot run in `folder`, if it cannot. */
+export async function startFolderProblem(folder: string): Promise<string | undefined> {
+  const stat = await fs.promises.stat(folder).catch(() => undefined)
+  if (stat === undefined) return `The folder for start_command, ${folder}, does not exist or cannot be opened.`
+  if (!stat.isDirectory()) return `The folder for start_command, ${folder}, is not a folder.`
+  // A command cannot start in a folder it may not enter.
+  const enterable = await fs.promises.access(folder, fs.constants.X_OK).then(
+    () => true,
+    () => false,
+  )
+  return enterable ? undefined : `The folder for start_command, ${folder}, cannot be opened.`
+}
+
+async function launchChromiumResilient(guardPort: number) {
   const { chromium } = await import("@playwright/test")
   for (const channel of [undefined, "msedge", "chrome"] as const) {
     try {
       return await chromium.launch({
         headless: true,
         ...(channel ? { channel } : {}),
+        // Every connection goes through the connection guard; `<-loopback>` sends loopback ones there too.
+        proxy: { server: `socks5://127.0.0.1:${guardPort}`, bypass: "<-loopback>" },
       })
     } catch {
       continue
@@ -224,8 +247,151 @@ async function launchChromiumResilient() {
   throw new Error("Could not launch headless Chromium, Microsoft Edge, or Chrome via Playwright.")
 }
 
+// A SOCKS5 proxy for the play-test browser that connects only to the addresses `allowed` returns for each target, and
+// connects to those, so a name is not resolved twice. The browser sends every TCP connection through it, loopback ones
+// included, and so redirect hops, speculation-rules prefetch and prerender, workers and WebSockets are checked here.
+// WebRTC's UDP does not pass through it; the engine's server does not listen on UDP.
+async function startConnectionGuard(
+  allowed: (
+    host: string,
+    port: number,
+  ) => Promise<{ readonly addresses: readonly string[] } | { readonly refused: string }>,
+) {
+  const open = new Set<net.Socket>()
+  const track = (socket: net.Socket) => {
+    open.add(socket)
+    socket.once("close", () => open.delete(socket))
+  }
+  const seen = { connections: 0 }
+  const refusals: { readonly host: string; readonly port: number; readonly why: string }[] = []
+  const server = net.createServer((client) => {
+    track(client)
+    client.on("error", () => client.destroy())
+    client.once("data", (greeting) => {
+      // Version 5, with "no authentication" among the methods offered.
+      if (greeting[0] !== 5 || !greeting.subarray(2).includes(0)) return client.destroy()
+      seen.connections++
+      client.write(Buffer.from([5, 0]))
+      client.once("data", (request) => {
+        client.pause()
+        const target = socksTarget(request)
+        if (target === undefined) return refuseSocks(client, 7)
+        allowed(target.host, target.port).then(
+          (decision) => {
+            if ("addresses" in decision)
+              return connectFirst(client, decision.addresses, target.port, track, () =>
+                refusals.push({ ...target, why: "nothing answered" }),
+              )
+            refusals.push({ ...target, why: `refused, ${decision.refused}` })
+            refuseSocks(client, 2)
+          },
+          () => refuseSocks(client, 1),
+        )
+      })
+    })
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolve)
+  })
+  const address = server.address()
+  return {
+    port: typeof address === "object" && address !== null ? address.port : 0,
+    /** How many connections the browser has sent through the guard. */
+    connections: () => seen.connections,
+    /** The connections the guard refused, and those whose server did not answer. */
+    refusals,
+    close: () => {
+      server.close()
+      for (const socket of open) socket.destroy()
+    },
+  }
+}
+
+// The host and port of a SOCKS5 CONNECT request: the version, command 1, a reserved byte, the address type (an IPv4
+// address, a name or an IPv6 address), the address and the port.
+function socksTarget(request: Buffer): { readonly host: string; readonly port: number } | undefined {
+  if (request[0] !== 5 || request[1] !== 1) return undefined
+  const type = request[3]
+  const length = type === 1 ? 4 : type === 4 ? 16 : type === 3 ? 1 + (request[4] ?? 0) : 0
+  if (length === 0 || request.length < 4 + length + 2) return undefined
+  const address = request.subarray(4, 4 + length)
+  const host =
+    type === 1
+      ? Array.from(address).join(".")
+      : type === 4
+        ? Array.from({ length: 8 }, (_, index) => address.readUInt16BE(index * 2).toString(16)).join(":")
+        : address.subarray(1).toString("latin1")
+  return { host, port: request.readUInt16BE(4 + length) }
+}
+
+// Connects to the first of `addresses` that answers, in the resolver's order, and joins it to the browser's socket.
+// As browsers do (Happy Eyeballs), the next address starts 250 ms after the one before, or at once when that one
+// fails, and the first to connect wins; so `localhost` reaches `::1` first, as in the user's browser, and a dead IPv6
+// address costs a quarter of a second.
+function connectFirst(
+  client: net.Socket,
+  addresses: readonly string[],
+  port: number,
+  track: (socket: net.Socket) => void,
+  unanswered: () => void,
+): void {
+  const pending = new Set<net.Socket>()
+  const progress = { started: 0, done: false, timer: undefined as ReturnType<typeof setTimeout> | undefined }
+  const finish = (winner?: net.Socket) => {
+    progress.done = true
+    clearTimeout(progress.timer)
+    for (const socket of pending) if (socket !== winner) socket.destroy()
+  }
+  client.once("close", () => finish())
+  const start = () => {
+    const address = addresses[progress.started]
+    if (progress.done || address === undefined) return
+    progress.started++
+    const upstream = net.connect({ host: address, port })
+    track(upstream)
+    pending.add(upstream)
+    upstream.once("error", () => {
+      pending.delete(upstream)
+      upstream.destroy()
+      if (progress.done) return
+      if (pending.size === 0 && progress.started >= addresses.length) {
+        finish()
+        unanswered()
+        return refuseSocks(client, 5)
+      }
+      start()
+    })
+    upstream.once("connect", () => {
+      if (progress.done) return upstream.destroy()
+      finish(upstream)
+      upstream.on("error", () => client.destroy())
+      // Succeeded. The browser does not use the bound address in the reply.
+      client.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]))
+      client.pipe(upstream)
+      upstream.pipe(client)
+    })
+    clearTimeout(progress.timer)
+    progress.timer = setTimeout(start, 250)
+  }
+  start()
+}
+
+// `host:port` with the host written one way, as the URL parser writes it (`[::1]` for `0:0:0:0:0:0:0:1`).
+function targetKey(host: string, port: number): string {
+  const bare = host.replace(/^\[|\]$/g, "")
+  const parsed = URL.parse(`http://${net.isIPv6(bare) ? `[${bare}]` : bare}/`)
+  return `${parsed?.hostname ?? bare.toLowerCase()}:${port}`
+}
+
+function refuseSocks(client: net.Socket, code: number): void {
+  client.end(Buffer.from([5, code, 0, 1, 0, 0, 0, 0, 0, 0]))
+}
+
 export interface PlaytestRuntimeHooks {
   readonly policyTier?: PolicyTier
+  /** The engine's own servers, which the page may not open or call. */
+  readonly ownServers?: readonly string[]
   readonly onRequireCommandApproval?: (command: string, reason: string) => Promise<void>
 }
 
@@ -248,7 +414,8 @@ export async function runPlaytestUrl(
     content: [{ type: "text", text: message }],
   })
 
-  const validated = validatePlaytestTargetUrl(input.url)
+  const ownServers = hooks?.ownServers ?? []
+  const validated = validatePlaytestTargetUrl(input.url, ownServers)
   if (!validated.ok) {
     return emptyErrorResult(validated.error)
   }
@@ -277,6 +444,8 @@ export async function runPlaytestUrl(
         )
       }
 
+      const folderProblem = await startFolderProblem(effectiveCwd)
+      if (folderProblem !== undefined) return emptyErrorResult(folderProblem)
       const cleanEnv = scrubEnvironmentRecord(process.env) as NodeJS.ProcessEnv
       serverProc = childProcess.spawn(startCmd, {
         cwd: effectiveCwd,
@@ -292,67 +461,125 @@ export async function runPlaytestUrl(
       }
       serverProc.stdout?.on("data", appendLog)
       serverProc.stderr?.on("data", appendLog)
+      // A failed spawn ends the wait below with its error, rather than crashing the engine.
+      const spawn: { error?: Error } = {}
+      serverProc.on("error", (error) => {
+        spawn.error = error
+      })
 
-      const readiness = await waitForLocalPortReady(validated.host, validated.port, serverProc, 18_000)
+      const readiness = await waitForLocalPortReady(validated.host, validated.port, serverProc, 18_000, () => spawn.error)
       if (!readiness.ready) {
         killProcessTree(serverProc)
         const why =
-          readiness.exitedEarlyCode !== null
-            ? `Dev server \`${startCmd}\` exited early with code ${readiness.exitedEarlyCode} before ${validated.host}:${validated.port} opened.`
-            : `Timed out waiting for \`${startCmd}\` to open ${validated.host}:${validated.port}.`
+          readiness.spawnError !== undefined
+            ? `Could not start \`${startCmd}\`: ${readiness.spawnError.message}`
+            : readiness.exitedEarlyCode !== null
+              ? `Dev server \`${startCmd}\` exited early with code ${readiness.exitedEarlyCode} before ${validated.host}:${validated.port} opened.`
+              : `Timed out waiting for \`${startCmd}\` to open ${validated.host}:${validated.port}.`
         const msg = redactKnownSecrets(`${why}\nServer logs:\n${serverLogs.slice(-3000)}`)
         return emptyErrorResult(msg)
       }
     }
   }
 
+  // The browser's own error for a closed port would name the connection guard instead. A closed loopback port refuses
+  // at once, so a long timeout costs nothing and rides out a busy engine.
+  if (!(await checkTcpPortOpen(validated.host, validated.port, 2_000))) {
+    const shown = validated.host.includes(":") ? `[${validated.host}]` : validated.host
+    return emptyErrorResult(
+      `Nothing is listening on ${shown}:${validated.port}. Start the dev server first, or pass start_command.`,
+    )
+  }
+
   let browser: Awaited<ReturnType<typeof launchChromiumResilient>> | undefined
+  let guard: Awaited<ReturnType<typeof startConnectionGuard>> | undefined
   const consoleErrors: string[] = []
   const consoleWarnings: string[] = []
   const dialogs: string[] = []
   const networkErrors: string[] = []
   const screenshots: Tool.FileContent[] = []
+  const external = input.allow_external_assets === true
+  // The servers the pages asked for, redirect hops included, as `host:port`.
+  const requested = new Set<string>()
+  // What the guard refused or could not reach, for the report: a refused connection shows in the page only as a SOCKS
+  // error. The engine's own server comes first, whatever asked for it; other targets only when a page asked for them,
+  // which leaves out the browser's own background connections to its vendor's hosts.
+  const guardNotes = () =>
+    [
+      ...new Map(
+        (guard?.refusals ?? [])
+          .map((item) => ({ ...item, target: targetKey(item.host, item.port) }))
+          .filter((item) => item.why.endsWith("own server") || requested.has(item.target))
+          .sort((a, b) => Number(!a.why.endsWith("own server")) - Number(!b.why.endsWith("own server")))
+          .map((item) => [item.target, `- ${item.target}: ${item.why}`]),
+      ).values(),
+    ].slice(0, 8)
 
   try {
-    browser = await launchChromiumResilient()
+    guard = await startConnectionGuard((host, port) =>
+      playtestConnectionAddresses(host, port, { ownServers, external }),
+    )
+    browser = await launchChromiumResilient(guard.port)
     const vp = resolvePlaytestViewport(input.viewport)
-    const context = await browser.newContext({ viewport: vp })
-    const page = await context.newPage()
+    // Service workers would fetch outside the routes below, and the routes cover every page, popups included.
+    const context = await browser.newContext({ viewport: vp, serviceWorkers: "block" })
 
-    await page.route("**/*", async (route) => {
+    // A browser policy can override the proxy setting, which would leave every check below to the page routes. So the
+    // browser's first connection, to the guard's own port, must reach the guard as a proxied one before the page opens.
+    // It is made in a tab of its own, so the test page's history starts clean.
+    const probe = await context.newPage()
+    await probe.goto(`http://127.0.0.1:${guard.port}/`, { timeout: 5_000 }).catch(() => undefined)
+    await probe.close()
+    if (guard.connections() === 0) {
+      return emptyErrorResult(
+        "playtest_url stopped: its browser does not send its connections through ABuCode's connection guard, which refuses this engine's own server. A browser policy may set the browser's proxy.",
+      )
+    }
+    const ask = (raw: string) => {
+      const url = URL.parse(raw)
+      if (url !== null && url.hostname !== "")
+        requested.add(targetKey(url.hostname, Number(url.port || (/^(?:https|wss):$/.test(url.protocol) ? 443 : 80))))
+    }
+    context.on("request", (request) => ask(request.url()))
+    // Playwright raises no request for a WebSocket, so each page's DevTools session reports them, refused ones included.
+    const watched = new WeakSet<object>()
+    const watchSockets = async (opened: Awaited<ReturnType<typeof context.newPage>>) => {
+      if (watched.has(opened)) return
+      watched.add(opened)
+      const session = await context.newCDPSession(opened).catch(() => undefined)
+      session?.on("Network.webSocketCreated", (event) => ask(event.url))
+      await session?.send("Network.enable").catch(() => undefined)
+    }
+    context.on("page", (opened) => void watchSockets(opened))
+    const page = await context.newPage()
+    await watchSockets(page)
+
+    // What the page may reach: data and blob URLs, the loopback servers it tests, and with allow_external_assets
+    // DNS-checked reads of public hosts. Never the engine's own server.
+    const reach = async (reqUrl: string, method: string): Promise<"page" | "local" | "public" | undefined> => {
+      if (reqUrl.startsWith("data:") || reqUrl.startsWith("blob:") || reqUrl.startsWith("about:")) return "page"
+      const parsed = URL.parse(reqUrl)
+      if (parsed === null || isOwnServerUrl(reqUrl, ownServers)) return undefined
+      if (isLoopbackHost(parsed.hostname)) {
+        const selfBlock = validateFetchUrlGuard(reqUrl, { method, allowLoopbackGet: true })
+        if (selfBlock && method !== "GET" && method !== "HEAD") return undefined
+        if (parsed.pathname.startsWith("/api/providers") || parsed.pathname.includes("abucode.control")) return undefined
+        return "local"
+      }
+      const read = method === "GET" || method === "HEAD"
+      if (input.allow_external_assets && read && !(await validateResolvedFetchUrlGuard(reqUrl, { method })))
+        return "public"
+      return undefined
+    }
+
+    // The browser routes only the first request of a redirect chain, and neither WebSockets nor speculation-rules
+    // prefetch and prerender; those pass only the connection guard, which refuses the engine's own server by address.
+    await context.route("**/*", async (route) => {
       const req = route.request()
-      const reqUrl = req.url()
-      if (reqUrl.startsWith("data:") || reqUrl.startsWith("blob:") || reqUrl.startsWith("about:")) {
-        await route.continue()
-        return
-      }
-      try {
-        const parsed = new URL(reqUrl)
-        if (isLoopbackHost(parsed.hostname)) {
-          const selfBlock = validateFetchUrlGuard(reqUrl, { method: req.method(), allowLoopbackGet: true })
-          if (selfBlock && req.method() !== "GET" && req.method() !== "HEAD") {
-            await route.abort("blockedbyclient")
-            return
-          }
-          if (parsed.pathname.startsWith("/api/providers") || parsed.pathname.includes("abucode.control")) {
-            await route.abort("blockedbyclient")
-            return
-          }
-          const nextHeaders = { ...req.headers(), [AGENT_SELF_HEADER]: "playtest_url" }
-          await route.continue({ headers: nextHeaders })
-          return
-        }
-        if (input.allow_external_assets && (req.method() === "GET" || req.method() === "HEAD")) {
-          const blockReason = await validateResolvedFetchUrlGuard(reqUrl, { method: req.method() })
-          if (!blockReason) {
-            await route.continue()
-            return
-          }
-        }
-      } catch {
-        // Fall through to abort
-      }
-      await route.abort("blockedbyclient")
+      const access = await reach(req.url(), req.method())
+      if (access === undefined) return route.abort("blockedbyclient")
+      if (access === "local") return route.continue({ headers: { ...req.headers(), [AGENT_SELF_HEADER]: "playtest_url" } })
+      return route.continue()
     })
 
     page.on("console", (msg) => {
@@ -395,7 +622,7 @@ export async function runPlaytestUrl(
         switch (step.action) {
           case "goto": {
             const targetRaw = step.value ? new URL(step.value, page.url()).toString() : page.url()
-            const sub = validatePlaytestTargetUrl(targetRaw)
+            const sub = validatePlaytestTargetUrl(targetRaw, ownServers)
             if (!sub.ok) throw new Error(sub.error)
             await page.goto(sub.url, { waitUntil: "domcontentloaded", timeout })
             stepNotes.push(`✓ Step ${idx + 1}: goto ${sub.url} (${Date.now() - stepStart}ms)`)
@@ -564,6 +791,7 @@ export async function runPlaytestUrl(
         ? ["", "### Console Warnings", ...consoleWarnings.slice(0, 8).map((w) => `- ${w}`)]
         : []),
       ...(networkErrors.length > 0 ? ["", "### HTTP 4xx/5xx Errors", ...networkErrors.map((e) => `- ${e}`)] : []),
+      ...(guardNotes().length > 0 ? ["", "### Connections Refused or Unanswered", ...guardNotes()] : []),
       ...(domSnippet.trim()
         ? ["", "### Visible DOM Snapshot", "```text", redactKnownSecrets(domSnippet.trim()), "```"]
         : []),
@@ -586,10 +814,17 @@ export async function runPlaytestUrl(
       content: [{ type: "text", text: report }, ...screenshots],
     }
   } catch (err) {
-    const msg = redactKnownSecrets(`Playtest error: ${err instanceof Error ? err.message : String(err)}`)
+    const notes = guardNotes()
+    const msg = redactKnownSecrets(
+      [
+        `Playtest error: ${err instanceof Error ? err.message : String(err)}`,
+        ...(notes.length > 0 ? ["", "Connections refused or unanswered:", ...notes] : []),
+      ].join("\n"),
+    )
     return emptyErrorResult(msg)
   } finally {
     if (browser) await browser.close().catch(() => undefined)
+    guard?.close()
     if (serverProc && !reusedServer) killProcessTree(serverProc)
   }
 }

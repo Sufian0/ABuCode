@@ -1,7 +1,8 @@
+import fs from "node:fs"
 import path from "node:path"
-import { SystemPart } from "@opencode/ai/effect"
+import { AssistantMessage, SystemMessage, SystemPart, ToolMessage, UserMessage } from "@opencode/ai/effect"
 import { define } from "@opencode/plugin/effect/plugin"
-import type { SessionHooks } from "@opencode/plugin/effect/session"
+import type { SessionHooks, SessionRequest, SessionRequestMessage } from "@opencode/plugin/effect/session"
 import type { AssertInput } from "@opencode/plugin/permission"
 import {
   ABuCode,
@@ -16,6 +17,7 @@ import { Session } from "@opencode/schema/session"
 import { Tool } from "@opencode/schema/tool"
 import { FSUtil } from "@opencode/util/fs-util"
 import { Global } from "@opencode/util/global"
+import { ServerAddress } from "@opencode/util/server-address"
 import { Context, DateTime, Effect, Option, Schema, Stream } from "effect"
 import {
   archiveSessionToChatHistory,
@@ -31,7 +33,14 @@ import {
   getGeneralCharacters,
   normalizeCharacterChoice,
 } from "./household.js"
-import { isPlaytestTargetPortOpen, PlaytestInput, PlaytestOutput, runPlaytestUrl } from "./playtest.js"
+import {
+  isPlaytestTargetPortOpen,
+  PlaytestInput,
+  PlaytestOutput,
+  runPlaytestUrl,
+  startFolderProblem,
+  validatePlaytestTargetUrl,
+} from "./playtest.js"
 import {
   applyABuCodeProviderTransform,
   getProviderKeysStatus,
@@ -49,13 +58,18 @@ import {
 import {
   classifyCatastrophicCommand,
   commandStagesSecretEnvFile,
+  engineServiceFiles,
+  engineStateFileReason,
   evaluateShellPolicyDecision,
   isEngineConfigPath,
+  isEngineStatePath,
+  knownSecretValues,
+  maskStrings,
   normalizePolicyTier,
-  redactKnownSecrets,
   scrubEnvironmentInPlace,
   secretFileAccessReason,
   shellConfigWrites,
+  shellEngineStateReferences,
   systemConfigDirectory,
   validateResolvedFetchUrlGuard,
 } from "./security.js"
@@ -73,12 +87,18 @@ import {
   RunWorkflowInput,
   RunWorkflowOutput,
   SQUAD_ROLES,
+  type SubagentGuard,
   TurnAgentBudget,
 } from "./squad.js"
 import { isCustomPoeBot, sanitizePoeRequestBodyJson, wrapResilientLanguageModel } from "./stream-bridge.js"
 
 const decodeString = Schema.decodeUnknownOption(Schema.String)
 const decodeSquadJson = Schema.decodeUnknownOption(Schema.fromJsonString(ABuCode.SquadSettings))
+// The `url` of the CLI's service registration file, `<state>/service-<channel>.json`, and the password both service
+// files hold.
+const decodeRegistration = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Struct({ url: Schema.String })))
+const decodePassword = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Struct({ password: Schema.String })))
+const ENGINE_PASSWORD_MASK = "[REDACTED ENGINE PASSWORD]"
 
 const KEY_DEFAULT_CHARACTER = "global:character"
 const KEY_DEFAULT_POLICY = "global:policy"
@@ -612,6 +632,41 @@ export default define({
         },
       })
 
+    const global = yield* Global.Service
+    const configDirs = {
+      cwd: ctx.location.directory,
+      home: global.home,
+      // The system folder's plugin folder loads like the global one, and on Windows a standard user can usually create it.
+      roots: [global.config, systemConfigDirectory()],
+      files: process.env.OPENCODE_CONFIG ? [process.env.OPENCODE_CONFIG] : [],
+    }
+    // The engine's own state: the CLI keeps the server password in service files in the config and state folders,
+    // wherever a CLI process resolved them, and core keeps every session and the Policy tier in its database.
+    const database = process.env.OPENCODE_DB
+    const engineState = {
+      cwd: ctx.location.directory,
+      home: global.home,
+      service: [
+        ...new Set([
+          global.config,
+          global.state,
+          Global.Path.config,
+          Global.Path.state,
+          ...[process.env.ABUCODE_CONFIG_DIR, process.env.OPENCODE_CONFIG_DIR].filter((dir) => dir !== undefined),
+        ]),
+      ],
+      data: [...new Set([global.data, Global.Path.data])],
+      databases: database === undefined || database === ":memory:" ? [] : [path.resolve(global.data, database)],
+    }
+    // The managed service records its address in a registration file in the state folder, so an engine started another
+    // way, such as `--standalone`, refuses requests to it too.
+    const registeredServers = Effect.promise(() =>
+      Promise.all(
+        engineServiceFiles([global.state]).map((file) => fs.promises.readFile(file, "utf8").catch(() => "")),
+      ),
+    ).pipe(Effect.map((texts) => texts.flatMap((text) => Option.toArray(decodeRegistration(text)).map((info) => info.url))))
+    const ownServers = registeredServers.pipe(Effect.map((registered) => [...ServerAddress.list(), ...registered]))
+
     yield* ctx.shell.hook("create.before", (event) =>
       Effect.sync(() => {
         scrubEnvironmentInPlace(event.env)
@@ -630,26 +685,47 @@ export default define({
         const combined = event.resources.join("\n")
         const cwd = ctx.location.directory ?? process.cwd()
         const decision = evaluateShellPolicyDecision(settings.policy, combined, event.effect, cwd)
-        event.effect = decision.effect
-        if (decision.message) event.message = decision.message
-        if (decision.effect === "ask") {
-          yield* notifyApprovalNeeded(
-            event.sessionID,
-            "⏸ Approve a command · ABuCode",
-            decision.message ?? combined.slice(0, 120),
-          )
+        // ABuCode's own request for a command that names the engine's state files (assertShellEngineState below) asks in
+        // every Policy tier but Turbo, and is refused in unattended work, where nobody can approve it.
+        const state = event.metadata?.engineState
+        // An automation's shell action is approved once, when it is made, and its runs are not checked again. This hook
+        // lets core's effect stand when it fails, so a command the scan cannot read counts as naming the state.
+        const command = event.metadata?.automation !== undefined ? event.metadata?.command : undefined
+        const automation =
+          typeof command === "string"
+            ? yield* Effect.try(() =>
+                shellEngineStateReferences(command, engineState, { powershell: process.platform === "win32" }).map(
+                  (file) => path.basename(file),
+                ),
+              ).pipe(Effect.orElseSucceed(() => ["a command ABuCode could not read"]))
+            : []
+        const named = [
+          ...new Set([
+            ...(Array.isArray(state) ? state.filter((item): item is string => typeof item === "string") : []),
+            ...automation,
+          ]),
+        ]
+        const stateMessage =
+          named.length > 0 && decision.effect !== "deny"
+            ? `ABuCode asks: this command reads or changes the engine's own state, its password or its database (${named.join(", ")}).`
+            : undefined
+        if (stateMessage !== undefined && (yield* Unattended) !== undefined) {
+          event.effect = "deny"
+          event.message = `ABuCode refuses, in unattended work, a command that reads or changes the engine's own state (${named.join(", ")}).`
+          return
+        }
+        event.effect = stateMessage === undefined ? decision.effect : settings.policy === "turbo" ? "allow" : "ask"
+        // A shell command run from the tool asks again for the Policy tier on core's own request. An automation's shell
+        // action makes only this one, so the tier's reason is shown here beside the state reason.
+        const tierReason = automation.length > 0 && decision.effect === "ask" ? decision.message : undefined
+        const message =
+          stateMessage === undefined ? decision.message : [stateMessage, tierReason].filter(Boolean).join(" ")
+        if (message) event.message = message
+        if (event.effect === "ask") {
+          yield* notifyApprovalNeeded(event.sessionID, "⏸ Approve a command · ABuCode", message ?? combined.slice(0, 120))
         }
       }).pipe(Effect.catchCause(() => Effect.void)),
     )
-
-    const global = yield* Global.Service
-    const configDirs = {
-      cwd: ctx.location.directory,
-      home: global.home,
-      // The system folder's plugin folder loads like the global one, and on Windows a standard user can usually create it.
-      roots: [global.config, systemConfigDirectory()],
-      files: process.env.OPENCODE_CONFIG ? [process.env.OPENCODE_CONFIG] : [],
-    }
 
     // A shell command that visibly writes engine config asks for `edit` on those files, so the hook below asks or refuses
     // as it does for the file tools. Files are named as the file tools name them, relative inside the working folder, so
@@ -669,6 +745,27 @@ export default define({
           return named.replaceAll("\\", "/")
         }),
         metadata: { input: workdir === undefined ? { command } : { command, workdir } },
+      })
+    }
+
+    // A shell command that names the engine's own state files asks for `shell` on the whole command, which the shell hook
+    // above settles. Only the tool hooks see the command whole with the folder it runs in: core's own shell request
+    // leaves out `cd` commands and the shell tool's working folder.
+    const assertShellEngineState = (
+      command: string,
+      workdir: string | undefined,
+      call: Pick<AssertInput, "sessionID" | "agent" | "source">,
+    ) => {
+      const named = shellEngineStateReferences(command, engineState, { workdir, powershell: process.platform === "win32" })
+      if (named.length === 0) return Effect.void
+      return ctx.permission.assert({
+        ...call,
+        action: "shell",
+        resources: [command],
+        metadata: {
+          input: workdir === undefined ? { command } : { command, workdir },
+          engineState: [...new Set(named.map((file) => path.basename(file)))],
+        },
       })
     }
 
@@ -694,6 +791,66 @@ export default define({
       }),
     )
 
+    // Every file read and write asks for `read` or `edit` on its path, also from patch, Code Mode and the tools that save
+    // images, which the tool hook below cannot all see. None of them may use the engine's own state files.
+    yield* ctx.permission.hook("evaluate", (event) =>
+      Effect.sync(() => {
+        if ((event.action !== "read" && event.action !== "edit") || event.effect === "deny") return
+        const files = event.resources.filter((resource) => isEngineStatePath(resource, engineState))
+        if (files.length === 0) return
+        event.effect = "deny"
+        event.message = `ABuCode refuses the agent the engine's own state files, which hold its password and its database: ${files.join(", ")}`
+      }),
+    )
+
+    // Every URL the agent fetches asks for `webfetch` and names it in the metadata: the webfetch tool, Code Mode's fetch,
+    // each redirect hop of both, image downloads and the URLs handed to video generation. So the address check here sees
+    // all of them. An automation's approval asks for its rules' patterns instead, which are left to the rules.
+    yield* ctx.permission.hook("evaluate", (event) =>
+      Effect.gen(function* () {
+        if (event.action !== "webfetch" || event.effect === "deny" || typeof event.metadata?.url !== "string") return
+        const parsed = event.resources.map((resource) => URL.parse(resource))
+        const urls = parsed.filter((url): url is URL => url?.protocol === "http:" || url?.protocol === "https:")
+        // Bun's fetch also reads `localhost:4096/x` as an http URL, and follows other schemes such as `s3:`.
+        if (urls.length !== parsed.length) {
+          event.effect = "deny"
+          event.message = "ABuCode lets the agent fetch only http:// and https:// URLs."
+          return
+        }
+        const servers = yield* ownServers
+        const guard = (url: URL, method: string) =>
+          Effect.promise(() =>
+            validateResolvedFetchUrlGuard(url.href, {
+              method,
+              allowLoopbackGet: true,
+              allowLocalGet: true,
+              ownServers: servers,
+            }),
+          )
+        // The engine's own server, cloud metadata and reserved addresses, and names that do not resolve are refused.
+        const refused = (yield* Effect.forEach(urls, (url) => guard(url, "GET"))).find((reason) => reason !== undefined)
+        if (refused !== undefined) {
+          event.effect = "deny"
+          event.message = refused
+          return
+        }
+        // Code Mode's fetch names its method. Anything but GET and HEAD to this machine or the LAN asks. A redirect hop
+        // cannot ask, and in unattended work nobody can answer, so there it is refused.
+        const method = typeof event.metadata.method === "string" ? event.metadata.method.toUpperCase() : "GET"
+        if (method === "GET" || method === "HEAD") return
+        const local = (yield* Effect.forEach(urls, (url) => guard(url, method))).find((reason) => reason !== undefined)
+        if (local === undefined) return
+        if (event.metadata.redirectedFrom !== undefined || (yield* Unattended) !== undefined) {
+          event.effect = "deny"
+          event.message = local
+          return
+        }
+        event.effect = "ask"
+        event.message = `ABuCode asks before a ${method} request to this machine or the local network: ${urls.map((url) => url.host).join(", ")}`
+        yield* notifyApprovalNeeded(event.sessionID, "⏸ Approve a local request · ABuCode", event.message)
+      }),
+    )
+
     yield* ctx.tool.hook("execute.before", (event) =>
       Effect.gen(function* () {
         const inputObj =
@@ -706,44 +863,37 @@ export default define({
         const isReadOrSearchTool = ["read", "grep", "glob"].includes(event.tool)
         if (isWriteTool || isReadOrSearchTool) {
           const mode = isWriteTool ? "write" : event.tool === "read" ? "read" : "search"
+          // A grep without a path, or with a blank one, searches the Location.
+          const blank = typeof inputObj.path !== "string" || inputObj.path.trim() === ""
+          const fields = event.tool === "grep" && blank ? { ...inputObj, path: "." } : inputObj
           for (const field of ["filePath", "path", "target", "include", "pattern"]) {
-            const val = inputObj[field]
+            const val = fields[field]
             if (typeof val === "string" && val.trim()) {
-              const reason = secretFileAccessReason(val.trim(), { mode })
+              // A grep reads the files below its path; a glob only lists names.
+              const reason =
+                secretFileAccessReason(val.trim(), { mode }) ??
+                (field === "include" || field === "pattern"
+                  ? undefined
+                  : engineStateFileReason(val.trim(), engineState, event.tool === "glob" ? "read" : mode))
               if (reason) return yield* Effect.fail(new Tool.Error({ message: reason }))
             }
           }
         }
 
-        // 1b. Shell commands that write engine config. Only this hook sees the agent's command whole, with its working
-        // folder; the shell's own hook also runs the user's commands and cannot ask.
+        // 1b. Shell commands that write engine config or name the engine's own state files. Only this hook sees the
+        // agent's command whole, with its working folder; the shell's own hook also runs the user's commands and cannot ask.
         if (event.tool === "shell" && typeof inputObj.command === "string") {
-          yield* assertShellConfigWrites(
-            inputObj.command,
-            typeof inputObj.workdir === "string" ? inputObj.workdir : undefined,
-            {
-              sessionID: event.sessionID,
-              agent: event.agent,
-              source: { type: "tool", messageID: event.messageID, id: event.id },
-            },
-          )
+          const workdir = typeof inputObj.workdir === "string" ? inputObj.workdir : undefined
+          const call = {
+            sessionID: event.sessionID,
+            agent: event.agent,
+            source: { type: "tool" as const, messageID: event.messageID, id: event.id },
+          }
+          yield* assertShellConfigWrites(inputObj.command, workdir, call)
+          yield* assertShellEngineState(inputObj.command, workdir, call)
         }
 
-        // 2. DNS-resolving SSRF, Cloud Metadata & Self-API shield on webfetch
-        if (event.tool === "webfetch" && typeof inputObj.url === "string") {
-          const rawUrl = inputObj.url
-          const method = typeof inputObj.method === "string" ? inputObj.method : "GET"
-          const blockReason = yield* Effect.promise(() =>
-            validateResolvedFetchUrlGuard(rawUrl, {
-              method,
-              allowLoopbackGet: true,
-              allowLocalGet: true,
-            }),
-          )
-          if (blockReason) return yield* Effect.fail(new Tool.Error({ message: blockReason }))
-        }
-
-        // 3. Tool-round limit pause gate (+10 extra rounds confirmation)
+        // 2. Tool-round limit pause gate (+10 extra rounds confirmation)
         const nextCount = (sessionToolRounds.get(event.sessionID) ?? 0) + 1
         sessionToolRounds.set(event.sessionID, nextCount)
         const ceiling = sessionToolCeiling.get(event.sessionID) ?? DEFAULT_TOOL_ROUND_CEILING
@@ -762,23 +912,96 @@ export default define({
       }),
     )
 
+    // The engine's own password is masked in every tool result and model request, so a command that reads it in a way
+    // the checks above miss does not hand it over: as written, as the service files hold it (JSON-escaped), and as a
+    // Basic credential or an `auth_token` carries it, which the clients encode as UTF-8. A password under 8 characters is
+    // too likely to stand for something else in text, so only its credential is masked.
+    const engineSecrets = Effect.promise(() =>
+      Promise.all(
+        engineServiceFiles(engineState.service).map((file) => fs.promises.readFile(file, "utf8").catch(() => "")),
+      ),
+    ).pipe(
+      // A server started with OPENCODE_PASSWORD has its password in no file, so the servers' own record counts too.
+      Effect.map((texts) =>
+        [
+          ...texts.flatMap((text) => Option.getOrUndefined(decodePassword(text))?.password ?? []),
+          ...ServerAddress.passwords(),
+        ].flatMap((password) => {
+          if (password === "") return []
+          const token = Buffer.from(`opencode:${password}`).toString("base64")
+          const written = password.length < 8 ? [] : [password, JSON.stringify(password).slice(1, -1)]
+          return [...written, token, encodeURIComponent(token)]
+        }),
+      ),
+      // Longest first, so a form that contains another is masked whole.
+      Effect.map((secrets) => [...new Set(secrets)].sort((a, b) => b.length - a.length)),
+    )
+
+    // Masks the engine's password and the provider keys. Read once per hook call: a tool's structured output, or a long
+    // session, can hold thousands of strings. A vault value under 16 characters is a placeholder such as `disabled`, not
+    // a key, and masking it would hide that word everywhere.
+    const secretMask = engineSecrets.pipe(
+      Effect.map((secrets) => {
+        const keys = knownSecretValues().filter((key) => key.length >= 16)
+        return (text: string) =>
+          secrets.reduce(
+            (masked, secret) => masked.replaceAll(secret, ENGINE_PASSWORD_MASK),
+            keys.reduce((masked, key) => masked.replaceAll(key, "[REDACTED API KEY]"), text),
+          )
+      }),
+    )
+
     yield* ctx.tool.hook("execute.after", (event) =>
-      Effect.sync(() => {
-        if (event.status !== "completed") return
-        const content = event.result.content
-        if (typeof content === "string") {
-          event.result = { ...event.result, content: redactKnownSecrets(content) }
+      Effect.gen(function* () {
+        const redact = yield* secretMask
+        if (event.status === "error") {
+          const message = redact(event.error.message)
+          const metadata = event.error.metadata === undefined ? undefined : maskStrings(event.error.metadata, redact)
+          // Core shows the model a wrapped cause's own message in place of this one, so a cause that holds a secret is
+          // dropped and the masked message shown instead.
+          const cause = event.error.error
+          const causeText = cause instanceof Error ? `${cause.message}\n${cause.stack ?? ""}` : String(cause ?? "")
+          const causeLeaks = redact(causeText) !== causeText
+          if (message !== event.error.message || metadata !== event.error.metadata || causeLeaks)
+            event.error = new Tool.Error({ message, ...(causeLeaks ? {} : { error: cause }), metadata })
           return
         }
-        if (Array.isArray(content)) {
-          event.result = {
-            ...event.result,
-            content: content.map((part) =>
-              part.type === "text" ? { ...part, text: redactKnownSecrets(part.text) } : part,
-            ),
-          }
+        // The structured output too: Code Mode hands it to the program that called the tool.
+        const output = event.result.output === undefined ? {} : { output: maskStrings(event.result.output, redact) }
+        const content = event.result.content
+        if (typeof content === "string") {
+          event.result = { ...event.result, ...output, content: redact(content) }
+          return
+        }
+        event.result = {
+          ...event.result,
+          ...output,
+          ...(Array.isArray(content)
+            ? { content: content.map((part) => (part.type === "text" ? { ...part, text: redact(part.text) } : part)) }
+            : {}),
         }
       }),
+    )
+
+    // The model reads more than tool results: a background or timed-out shell command's output arrives later as a
+    // session message, and a pasted or compacted text can hold a secret too. So the password and the provider keys are
+    // masked again in everything each model request is built from.
+    const maskModelInput = (event: SessionRequest) =>
+      Effect.gen(function* () {
+        const mask = yield* secretMask
+        event.system = event.system.map((part) => maskStrings(part, mask))
+        event.messages = event.messages.map((message) => maskMessage(message, mask))
+      })
+    yield* ctx.session.hook("context", maskModelInput)
+    yield* ctx.session.hook("compaction", maskModelInput)
+    yield* ctx.session.hook("generate", maskModelInput)
+    yield* ctx.session.hook("title", maskModelInput)
+
+    // Squad and Household subagents run their own read tools and model requests, which none of the hooks above see.
+    const subagentGuard = secretMask.pipe(
+      Effect.map(
+        (mask): SubagentGuard => ({ mask, refuse: (target, mode) => engineStateFileReason(target, engineState, mode) }),
+      ),
     )
 
     yield* ctx.tool.transform((tools) => {
@@ -794,15 +1017,27 @@ export default define({
           Effect.gen(function* () {
             const settings = yield* buildSessionSettings(toolCtx.sessionID)
             const startCmd = input.start_command?.trim() ?? ""
+            // The folder start_command runs in, resolved once, so the checks below read it where it runs.
+            const effectiveCwd = path.resolve(
+              ctx.location.directory ?? process.cwd(),
+              input.cwd ? input.cwd.replace(/^~(?=$|[\\/])/, global.home) : ".",
+            )
+            // The URL and the folder are checked before any prompt, so nobody approves a command that will not run.
+            const servers = yield* ownServers
+            const target = validatePlaytestTargetUrl(input.url, servers)
+            if (!target.ok) return yield* Effect.fail(new Tool.Error({ message: target.error }))
             if (startCmd) {
               const alreadyOpen = yield* Effect.promise(() => isPlaytestTargetPortOpen(input.url))
               if (!alreadyOpen) {
-                yield* assertShellConfigWrites(startCmd, input.cwd || undefined, {
+                const folderProblem = yield* Effect.promise(() => startFolderProblem(effectiveCwd))
+                if (folderProblem !== undefined) return yield* Effect.fail(new Tool.Error({ message: folderProblem }))
+                const call = {
                   sessionID: toolCtx.sessionID,
                   agent: toolCtx.agent,
-                  source: { type: "tool", messageID: toolCtx.messageID, id: toolCtx.id },
-                })
-                const effectiveCwd = input.cwd || (ctx.location.directory ?? process.cwd())
+                  source: { type: "tool" as const, messageID: toolCtx.messageID, id: toolCtx.id },
+                }
+                yield* assertShellConfigWrites(startCmd, effectiveCwd, call)
+                yield* assertShellEngineState(startCmd, effectiveCwd, call)
                 const decision = evaluateShellPolicyDecision(settings.policy, startCmd, "allow", effectiveCwd)
                 if (decision.effect === "deny") {
                   return yield* Effect.fail(
@@ -836,8 +1071,11 @@ export default define({
               }
             }
 
+            // Read again after any prompt: a server of the engine may have started while it was open.
+            const current = yield* ownServers
             return yield* Effect.tryPromise({
-              try: () => runPlaytestUrl(input, { policyTier: settings.policy }),
+              try: () =>
+                runPlaytestUrl({ ...input, cwd: effectiveCwd }, { policyTier: settings.policy, ownServers: current }),
               catch: (cause) =>
                 new Tool.Error({
                   message: cause instanceof Error ? cause.message : String(cause),
@@ -912,8 +1150,9 @@ export default define({
                 )
             }
 
+            const guard = yield* subagentGuard
             const executed = yield* Effect.tryPromise({
-              try: () => executeSquadWorkflow(plan, reportStore),
+              try: () => executeSquadWorkflow(plan, reportStore, { guard }),
               catch: (err) =>
                 new Tool.Error({
                   message: err instanceof Error ? err.message : String(err),
@@ -990,6 +1229,7 @@ export default define({
             const budget = getOrCreateAgentBudget(toolCtx.sessionID, settings.squad)
             const reportStore = getOrCreateReportStore(toolCtx.sessionID)
 
+            const guard = yield* subagentGuard
             const res = yield* Effect.tryPromise({
               try: () =>
                 runHouseholdSubagents(input, {
@@ -1000,6 +1240,7 @@ export default define({
                   defaultCharacter: settings.character,
                   budget,
                   reportStore,
+                  guard,
                 }),
               catch: (err) =>
                 new Tool.Error({
@@ -1305,3 +1546,28 @@ export default define({
     })
   }),
 })
+
+/** `message` with `mask` applied to the text the model reads in it, or `message` itself when nothing changes. */
+function maskMessage(message: SessionRequestMessage, mask: (text: string) => string): SessionRequestMessage {
+  // Reasoning can carry a provider signature over its text, and media holds no text to mask.
+  const part = <Part extends { readonly type: string }>(item: Part) =>
+    item.type === "reasoning" || item.type === "media" ? item : maskStrings(item, mask)
+  const changed = (parts: ReadonlyArray<unknown>) => parts.some((item, index) => item !== message.content[index])
+  // A message class drops the stored metadata later hooks read, so it is put back the way core attaches it.
+  const keep = (rebuilt: SessionRequestMessage) =>
+    message.metadata === undefined ? rebuilt : { ...rebuilt, metadata: message.metadata }
+  if (message.role === "system") {
+    const content = message.content.map(part)
+    return changed(content) ? keep(new SystemMessage({ ...message, content })) : message
+  }
+  if (message.role === "user") {
+    const content = message.content.map(part)
+    return changed(content) ? keep(new UserMessage({ ...message, content })) : message
+  }
+  if (message.role === "assistant") {
+    const content = message.content.map(part)
+    return changed(content) ? keep(new AssistantMessage({ ...message, content })) : message
+  }
+  const content = message.content.map(part)
+  return changed(content) ? keep(new ToolMessage({ ...message, content })) : message
+}
