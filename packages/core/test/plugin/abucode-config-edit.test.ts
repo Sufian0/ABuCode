@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { existsSync } from "node:fs"
-import { mkdir } from "node:fs/promises"
+import { mkdir, rename, symlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { Agent } from "@opencode/core/agent"
 import { Bus } from "@opencode/core/bus"
@@ -10,6 +10,7 @@ import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { FileAccess } from "@opencode/core/file-access"
 import { FileWrite } from "@opencode/core/file-write"
 import { Instance } from "@opencode/core/instance/service"
+import { Location } from "@opencode/core/location"
 import { Permission } from "@opencode/core/permission"
 import { PersistentPty } from "@opencode/core/persistent-pty"
 import { Plugin } from "@opencode/core/plugin"
@@ -17,17 +18,21 @@ import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { Session } from "@opencode/core/session"
 import { SessionExecution } from "@opencode/core/session/execution"
 import { SessionMessage } from "@opencode/core/session/message"
+import { Tool } from "@opencode/core/tool"
+import { OpenCodeTools } from "@opencode/core/tool/plugin/opencode"
 import { ShellTool } from "@opencode/core/tool/plugin/shell"
+import { WorktreeStrategies } from "@opencode/core/worktree/strategies"
 import { systemConfigDirectory } from "@opencode/plugin-abucode/security"
 import { AbsolutePath } from "@opencode/schema/schema"
-import { Tool } from "@opencode/schema/tool"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Global } from "@opencode/util/global"
 import { Effect, Exit, Fiber, Layer, Option, Schedule } from "effect"
+import { initGit } from "../fixture/git"
 import { offlineModels } from "../fixture/models"
 import { disabledPersistentPtyLayer } from "../fixture/persistent-pty"
 import { tmpdir, tmpdirScoped } from "../fixture/tmpdir"
 import { testEffect } from "../lib/effect"
+import { executeTool } from "../lib/tool"
 
 // Each test gets its own home and config folders, so a regression cannot leave a plugin in the run's shared config folder,
 // or in a real one that ABUCODE_CONFIG_DIR points at.
@@ -70,7 +75,17 @@ const inSession = <A, E>(
   write: (
     files: FileWrite.Interface,
     context: FileAccess.Invocation,
-  ) => Effect.Effect<A, E, Permission.Service | Global.Service | PluginHooks.Service>,
+  ) => Effect.Effect<
+    A,
+    E,
+    | FileAccess.Service
+    | Global.Service
+    | Location.Service
+    | Permission.Service
+    | PluginHooks.Service
+    | Tool.Service
+    | WorktreeStrategies.Service
+  >,
   agent = Agent.defaultID,
 ) =>
   Effect.gen(function* () {
@@ -96,12 +111,12 @@ const inSession = <A, E>(
 const writeProbe = (files: FileWrite.Interface, context: FileAccess.Invocation, file: string) =>
   files.write({ path: file, content: "export default {}\n" }, context)
 
-// Runs the plugin's tool hook as the shell tool does before it starts a command; the command itself never runs.
-const shellHook = (context: FileAccess.Invocation, input: { readonly command: string; readonly workdir?: string }) =>
+// Runs the plugins' tool hooks as core does before it runs a tool; the tool itself never runs.
+const toolHook = (context: FileAccess.Invocation, tool: string, input: unknown) =>
   Effect.gen(function* () {
     const hooks = yield* PluginHooks.Service
     yield* hooks.trigger("tool", "execute.before", {
-      tool: "shell",
+      tool,
       codemode: false,
       sessionID: context.sessionID,
       agent: context.agent,
@@ -110,6 +125,9 @@ const shellHook = (context: FileAccess.Invocation, input: { readonly command: st
       input,
     })
   })
+
+const shellHook = (context: FileAccess.Invocation, input: { readonly command: string; readonly workdir?: string }) =>
+  toolHook(context, "shell", input)
 
 // Starts `attempt`, waits for its permission requests, rejects them, and reports what happened to `file`.
 const rejectRequests = <A, E, R>(context: FileAccess.Invocation, file: string, attempt: Effect.Effect<A, E, R>) =>
@@ -340,6 +358,330 @@ describe("ABuCode config edit guard", () => {
       )
 
       expect(result).toEqual({ written: true, pending: 0 })
+    }),
+  )
+})
+
+const outsideAsked = {
+  asks: [{ action: "edit", message: expect.stringMatching(/^ABuCode asks before any edit outside this project/) }],
+  writtenWhileAsking: false,
+  rejected: true,
+}
+
+const moveAsked = {
+  asks: [{ action: "edit", message: expect.stringMatching(/^ABuCode asks before a session moves out of its project/) }],
+  writtenWhileAsking: false,
+  rejected: true,
+}
+
+// Creating links needs extra rights on Windows.
+const withLinks = process.platform === "win32" ? it.live.skip : it.live
+
+describe("ABuCode outside-project edit guard", () => {
+  it.live("asks before a write outside the project and writes nothing until it is approved", () =>
+    Effect.gen(function* () {
+      const directory = (yield* tmpdirScoped()).path
+      const result = yield* inSession(directory, (files, context) =>
+        Effect.gen(function* () {
+          const global = yield* Global.Service
+          const file = path.join(global.home, ".zshenv")
+
+          return yield* rejectRequests(context, file, writeProbe(files, context, file))
+        }),
+      )
+
+      expect(result).toEqual(outsideAsked)
+    }),
+  )
+
+  it.live("does not ask for edits elsewhere in the session's repository, or for reads outside it", () =>
+    Effect.gen(function* () {
+      const repository = (yield* tmpdirScoped()).path
+      yield* Effect.promise(() => initGit(repository))
+      const directory = path.join(repository, "packages", "app")
+      yield* Effect.promise(() => mkdir(directory, { recursive: true }))
+      const result = yield* inSession(directory, (files, context) =>
+        Effect.gen(function* () {
+          const access = yield* FileAccess.Service
+          const global = yield* Global.Service
+          const permission = yield* Permission.Service
+          const outsideFile = path.join(global.home, "notes.txt")
+          yield* Effect.promise(() => mkdir(global.home, { recursive: true }))
+          yield* Effect.promise(() => writeFile(outsideFile, "notes\n"))
+          // A prompt instead would wait forever; the deadline turns that into a failure.
+          const edits = yield* Effect.all([
+            files.write({ path: "src/app.ts", content: "export {}\n" }, context),
+            files.write({ path: path.join(repository, "README.md"), content: "# App\n" }, context),
+          ]).pipe(Effect.timeout("5 seconds"), Effect.exit)
+          const read = yield* access.authorizeRead(outsideFile, context).pipe(Effect.timeout("5 seconds"), Effect.exit)
+
+          return {
+            edits: Exit.isSuccess(edits),
+            read: Exit.isSuccess(read),
+            pending: (yield* permission.forSession(context.sessionID)).length,
+          }
+        }),
+      )
+
+      expect(result).toEqual({ edits: true, read: true, pending: 0 })
+    }),
+  )
+
+  // An automation run approves whole actions such as `edit *`; core would settle the plugin's ask from that grant.
+  it.live("refuses a write outside the project in unattended work", () =>
+    Effect.gen(function* () {
+      const directory = (yield* tmpdirScoped()).path
+      const result = yield* inSession(directory, (files, context) =>
+        Effect.gen(function* () {
+          const global = yield* Global.Service
+          const permission = yield* Permission.Service
+          const file = path.join(global.home, ".gitconfig")
+          const exit = yield* writeProbe(files, context, file).pipe(
+            Effect.provideService(Permission.Unattended, [{ action: "edit", resource: "*", effect: "allow" }]),
+            Effect.exit,
+          )
+
+          return {
+            error: Option.getOrUndefined(Exit.findErrorOption(exit)),
+            pending: (yield* permission.forSession(context.sessionID)).length,
+            written: existsSync(file),
+          }
+        }),
+      )
+
+      expect(result.error).toBeInstanceOf(Permission.BlockedError)
+      expect(result.error).toMatchObject({
+        reason: expect.stringMatching(/^ABuCode refuses edits outside the project in unattended work/),
+      })
+      expect(result).toMatchObject({ pending: 0, written: false })
+    }),
+  )
+
+  withLinks("asks before a write that a link in the project leads outside it", () =>
+    Effect.gen(function* () {
+      const directory = (yield* tmpdirScoped()).path
+      const result = yield* inSession(directory, (files, context) =>
+        Effect.gen(function* () {
+          const global = yield* Global.Service
+          yield* Effect.promise(() => mkdir(global.home, { recursive: true }))
+          yield* Effect.promise(() => symlink(global.home, path.join(directory, "linked")))
+          // A write through a link whose target does not exist yet creates that target.
+          yield* Effect.promise(() => symlink(path.join(global.home, ".gitconfig"), path.join(directory, "notes.md")))
+          const throughFolder = yield* rejectRequests(
+            context,
+            path.join(global.home, ".zshenv"),
+            writeProbe(files, context, "linked/.zshenv"),
+          )
+          const throughFile = yield* rejectRequests(
+            context,
+            path.join(global.home, ".gitconfig"),
+            writeProbe(files, context, "notes.md"),
+          )
+
+          return { throughFolder, throughFile }
+        }),
+      )
+
+      expect(result).toEqual({ throughFolder: outsideAsked, throughFile: outsideAsked })
+    }),
+  )
+
+  it.live("asks once for a patch that also changes a file outside the project, and names only that file", () =>
+    Effect.gen(function* () {
+      const directory = (yield* tmpdirScoped()).path
+      const result = yield* inSession(directory, (_files, context) =>
+        Effect.gen(function* () {
+          const global = yield* Global.Service
+          const registry = yield* Tool.Service
+          const file = path.join(global.home, ".zshenv")
+          const patchText = [
+            "*** Begin Patch",
+            "*** Add File: src/app.ts",
+            "+export {}",
+            `*** Add File: ${file}`,
+            "+export PATH=/tmp/probe:$PATH",
+            "*** End Patch",
+          ].join("\n")
+
+          return yield* rejectRequests(
+            context,
+            file,
+            executeTool(registry, {
+              sessionID: context.sessionID,
+              agent: context.agent,
+              messageID: context.messageID,
+              call: { type: "tool-call", id: context.id, name: "patch", input: { patchText } },
+            }),
+          )
+        }),
+      )
+
+      expect(result).toEqual({
+        ...outsideAsked,
+        asks: [
+          {
+            action: "edit",
+            message: expect.stringMatching(/^ABuCode asks before any edit outside this project,.*: \S+\/\.zshenv$/),
+          },
+        ],
+      })
+      expect(existsSync(path.join(directory, "src/app.ts"))).toBe(false)
+    }),
+  )
+
+  it.live(
+    "lets edits reach the engine's temp folder and the plan folder, and asks for the rest of the temp folder",
+    () =>
+      Effect.gen(function* () {
+        const directory = (yield* tmpdirScoped()).path
+        const elsewhere = (yield* tmpdirScoped()).path
+        const result = yield* inSession(directory, (files, context) =>
+          Effect.gen(function* () {
+            const global = yield* Global.Service
+            const permission = yield* Permission.Service
+            const open = yield* Effect.all([
+              files.write({ path: path.join(global.tmp, "scratch", "probe.ts"), content: "export {}\n" }, context),
+              files.write(
+                { path: path.join(global.home, ".opencode", "plan", "probe.md"), content: "# Plan\n" },
+                context,
+              ),
+            ]).pipe(Effect.timeout("5 seconds"), Effect.exit)
+            const pending = (yield* permission.forSession(context.sessionID)).length
+            const file = path.join(elsewhere, "probe.ts")
+            const system = yield* rejectRequests(context, file, writeProbe(files, context, file))
+
+            return { open: Exit.isSuccess(open), pending, system }
+          }),
+        )
+
+        expect(result).toEqual({ open: true, pending: 0, system: outsideAsked })
+      }),
+  )
+
+  // The engine reads the real paths of the folders it lets edits reach once, before the agent can relink one.
+  withLinks("asks when the engine's temp folder has since been replaced by a link to elsewhere", () =>
+    Effect.gen(function* () {
+      const directory = (yield* tmpdirScoped()).path
+      const result = yield* inSession(directory, (files, context) =>
+        Effect.gen(function* () {
+          const global = yield* Global.Service
+          yield* Effect.promise(() => mkdir(global.home, { recursive: true }))
+          yield* Effect.promise(() => rename(global.tmp, `${global.tmp}-before`))
+          yield* Effect.promise(() => symlink(global.home, global.tmp))
+
+          return yield* rejectRequests(
+            context,
+            path.join(global.home, ".zshenv"),
+            writeProbe(files, context, path.join(global.tmp, ".zshenv")),
+          )
+        }),
+      )
+
+      expect(result).toEqual(outsideAsked)
+    }),
+  )
+
+  // The plugin's tool hook recognizes the session move tool by these names.
+  it.live("matches the session move tool's name and input fields", () =>
+    Effect.gen(function* () {
+      const directory = (yield* tmpdirScoped()).path
+      const names = yield* inSession(directory, () =>
+        Effect.gen(function* () {
+          const tools = yield* Tool.Service
+          return (yield* tools.list()).map((tool) => tool.id)
+        }),
+      )
+
+      expect(names).toContain("opencode_session_move")
+      expect(Object.keys(OpenCodeTools.MoveInput.fields)).toEqual(expect.arrayContaining(["sessionID", "directory"]))
+    }),
+  )
+
+  it.live("asks before a session moves out of its project, but not into the engine's worktree folder", () =>
+    Effect.gen(function* () {
+      const directory = (yield* tmpdirScoped()).path
+      const result = yield* inSession(directory, (_files, context) =>
+        Effect.gen(function* () {
+          const permission = yield* Permission.Service
+          const strategies = yield* WorktreeStrategies.Service
+          const worktree = path.join(strategies.get().directory, "task")
+          yield* Effect.promise(() => mkdir(worktree, { recursive: true }))
+          const into = yield* toolHook(context, "opencode_session_move", { directory: worktree }).pipe(
+            Effect.timeout("5 seconds"),
+            Effect.exit,
+          )
+          const pending = (yield* permission.forSession(context.sessionID)).length
+          // `~` is the engine's home, which holds this test's folders but lies outside the session's project.
+          const away = yield* rejectRequests(
+            context,
+            path.join(directory, "never-written"),
+            toolHook(context, "opencode_session_move", { directory: "~" }),
+          )
+
+          return { into: Exit.isSuccess(into), pending, away }
+        }),
+      )
+
+      expect(result).toEqual({ into: true, pending: 0, away: moveAsked })
+    }),
+  )
+
+  it.live("asks before a Code Mode program moves the session out of its project", () =>
+    Effect.gen(function* () {
+      const directory = (yield* tmpdirScoped()).path
+      const asks = yield* inSession(directory, (_files, context) =>
+        Effect.gen(function* () {
+          const registry = yield* Tool.Service
+          const outcome = yield* rejectRequests(
+            context,
+            path.join(directory, "never-written"),
+            executeTool(registry, {
+              sessionID: context.sessionID,
+              agent: context.agent,
+              messageID: context.messageID,
+              call: {
+                type: "tool-call",
+                id: context.id,
+                name: "execute",
+                input: { code: `return await tools.opencode.session.move({ directory: "~" })` },
+              },
+            }),
+          )
+
+          // The program sees the refusal as a failed call, so the execute call itself completes.
+          return outcome.asks
+        }),
+      )
+
+      expect(asks).toEqual(moveAsked.asks)
+    }),
+  )
+
+  it.live("refuses to move a session out of its project in unattended work", () =>
+    Effect.gen(function* () {
+      const directory = (yield* tmpdirScoped()).path
+      const elsewhere = (yield* tmpdirScoped()).path
+      const result = yield* inSession(directory, (_files, context) =>
+        Effect.gen(function* () {
+          const permission = yield* Permission.Service
+          // An automation's program names the tool by its Code Mode path.
+          const exit = yield* toolHook(context, "opencode.session.move", { directory: elsewhere }).pipe(
+            Effect.provideService(Permission.Unattended, [{ action: "*", resource: "*", effect: "allow" }]),
+            Effect.timeout("5 seconds"),
+            Effect.exit,
+          )
+
+          return {
+            error: Option.getOrUndefined(Exit.findErrorOption(exit)),
+            pending: (yield* permission.forSession(context.sessionID)).length,
+          }
+        }),
+      )
+
+      expect(result.error).toMatchObject({
+        message: expect.stringMatching(/^ABuCode refuses to move a session out of its project in unattended work/),
+      })
+      expect(result.pending).toBe(0)
     }),
   )
 })

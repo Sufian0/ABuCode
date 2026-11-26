@@ -49,9 +49,11 @@ import {
 import {
   classifyCatastrophicCommand,
   commandStagesSecretEnvFile,
+  editsOutsideProject,
   evaluateShellPolicyDecision,
   isEngineConfigPath,
   normalizePolicyTier,
+  projectFolders,
   redactKnownSecrets,
   scrubEnvironmentInPlace,
   secretFileAccessReason,
@@ -79,6 +81,12 @@ import { isCustomPoeBot, sanitizePoeRequestBodyJson, wrapResilientLanguageModel 
 
 const decodeString = Schema.decodeUnknownOption(Schema.String)
 const decodeSquadJson = Schema.decodeUnknownOption(Schema.fromJsonString(ABuCode.SquadSettings))
+// The fields of core's `opencode_session_move` input that say where a session goes.
+const decodeMoveInput = Schema.decodeUnknownOption(
+  Schema.Struct({ sessionID: Schema.optional(Schema.String), directory: Schema.String }),
+)
+// Marks the `edit` request the session move check makes, so the outside-project hook words its prompt for a move.
+const SESSION_MOVE = "abucode.sessionMove"
 
 const KEY_DEFAULT_CHARACTER = "global:character"
 const KEY_DEFAULT_POLICY = "global:policy"
@@ -125,6 +133,18 @@ interface ChangedPayload {
 // Core's Permission.Unattended, read by its key because plugins cannot import core. It is set while unattended work, such
 // as an automation run, asks for permission. core/test/plugin/abucode-config-edit.test.ts fails if the key stops matching.
 const Unattended = Context.Reference<unknown>("@opencode/Permission/Unattended", { defaultValue: () => undefined })
+
+const listFiles = (files: readonly string[]) =>
+  files.length > 3 ? `${files.slice(0, 3).join(", ")} and ${files.length - 3} more` : files.join(", ")
+
+// Where core's session move tool sends a session, as its own FileAccess.resolvePath reads the folder it is given.
+function moveDestination(base: string, directory: string, home = Global.Path.home) {
+  const normalized = FSUtil.windowsPath(directory)
+  if (normalized === "~") return path.resolve(home)
+  if (normalized.startsWith("~/") || (process.platform === "win32" && normalized.startsWith("~\\")))
+    return path.resolve(home, normalized.slice(2))
+  return path.resolve(base, normalized)
+}
 
 export default define({
   id: "abucode.core",
@@ -680,8 +700,7 @@ export default define({
         if (event.action !== "edit" || event.effect === "deny") return
         const config = event.resources.filter((resource) => isEngineConfigPath(resource, configDirs))
         if (config.length === 0) return
-        const files =
-          config.length > 3 ? `${config.slice(0, 3).join(", ")} and ${config.length - 3} more` : config.join(", ")
+        const files = listFiles(config)
         // In unattended work core settles an ask from the rules and the work's own grant, which would allow this edit.
         if ((yield* Unattended) !== undefined) {
           event.effect = "deny"
@@ -691,6 +710,75 @@ export default define({
         event.effect = "ask"
         event.message = `ABuCode asks before any edit to engine config, which can load plugins, start MCP servers and replace commands: ${files}`
         yield* notifyApprovalNeeded(event.sessionID, "⏸ Approve a config edit · ABuCode", event.message)
+      }),
+    )
+
+    // Outside its project an edit can change code that the engine or the user's shell runs later: a shell startup file,
+    // git's own config, a program on PATH, an installed plugin. Core names a file inside the project relative to the
+    // session's folder and one outside it by its absolute path, so the same `edit` requests show up here.
+    const projectDirs = projectFolders({
+      cwd: ctx.location.directory,
+      project: ctx.location.project.directory,
+      canonical: ctx.location.project.canonical,
+      worktrees: path.join(global.data, "worktree", ctx.location.project.id.slice(0, 6)),
+      home: global.home,
+      tmp: global.tmp,
+    })
+
+    // Registered after the config check, which already holds any request that also edits engine config. Like that
+    // check it asks even where permission rules allow the edit, and asks each time.
+    yield* ctx.permission.hook("evaluate", (event) =>
+      Effect.gen(function* () {
+        if (event.action !== "edit" || event.effect === "deny") return
+        if (event.resources.some((resource) => isEngineConfigPath(resource, configDirs))) return
+        const files = editsOutsideProject(event.resources, projectDirs)
+        if (files.length === 0) return
+        const named = listFiles(files)
+        const move = event.metadata?.[SESSION_MOVE] === true
+        if ((yield* Unattended) !== undefined) {
+          event.effect = "deny"
+          event.message = move
+            ? `ABuCode refuses to move a session out of its project in unattended work, where nobody can approve it: ${named}`
+            : `ABuCode refuses edits outside the project in unattended work, where nobody can approve them: ${named}`
+          return
+        }
+        event.effect = "ask"
+        event.message = move
+          ? `ABuCode asks before a session moves out of its project, since it could then edit files there without asking: ${named}`
+          : `ABuCode asks before any edit outside this project, which can change code the engine or your shell runs later: ${named}`
+        yield* notifyApprovalNeeded(
+          event.sessionID,
+          move ? "⏸ Approve moving the session · ABuCode" : "⏸ Approve an edit outside the project · ABuCode",
+          event.message,
+        )
+      }),
+    )
+
+    // A session moved to another folder treats that folder as its project, where edits no longer ask. So a move out of
+    // the project asks for `edit` on the destination, which the hook above asks or refuses for. A move into one of the
+    // project's own checkouts, such as a worktree the engine made, does not ask. Code Mode programs and automations call
+    // the same tool as `tools.opencode.session.move`; its name can reach here in either spelling.
+    yield* ctx.tool.hook("execute.before", (event) =>
+      Effect.gen(function* () {
+        if (event.tool.replaceAll(".", "_") !== "opencode_session_move") return
+        const input = Option.getOrUndefined(decodeMoveInput(event.input))
+        // Input the tool would reject never moves anything.
+        if (!input) return
+        const session = yield* ctx.session
+          .get({ sessionID: Session.ID.make(input.sessionID ?? event.sessionID) })
+          .pipe(
+            Effect.mapError(() => new Tool.Error({ message: "ABuCode could not check where this session would move" })),
+          )
+        const directory = moveDestination(session.location.directory, input.directory.trim())
+        if (editsOutsideProject([directory], projectDirs).length === 0) return
+        yield* ctx.permission.assert({
+          action: "edit",
+          resources: [directory.replaceAll("\\", "/")],
+          metadata: { [SESSION_MOVE]: true, input: { directory: input.directory } },
+          sessionID: event.sessionID,
+          agent: event.agent,
+          source: { type: "tool", messageID: event.messageID, id: event.id },
+        })
       }),
     )
 
