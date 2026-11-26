@@ -204,6 +204,68 @@ export function systemConfigDirectory(platform = process.platform, env = process
   return "/etc/opencode"
 }
 
+export interface ProjectFolders {
+  /** The folder a relative permission resource is relative to: the session's Location directory. */
+  readonly cwd: string
+  /** The real paths of the folders an edit may change without the outside-project prompt. */
+  readonly open: readonly string[]
+}
+
+/**
+ * The folders whose files an edit may change without the outside-project prompt, by their real paths as they are when
+ * this is called: the session's folder and its checkout, the repository's main checkout, the engine's worktree folder
+ * for the project, the Plan agent's plan folder and the engine's temp folder. They are read once, so a folder that is
+ * later replaced by a link to elsewhere does not take its exemption along.
+ */
+export function projectFolders(dirs: {
+  readonly cwd: string
+  /** The checkout the session is in; ignored, like `canonical`, when it is a filesystem root. */
+  readonly project: string
+  /** The repository's main checkout. */
+  readonly canonical: string
+  /** Core's default worktree folder for the project; abucode-config-edit.test.ts fails if the two differ. */
+  readonly worktrees?: string
+  /** The user's home folder; the Plan agent writes its plans in `<home>/.opencode/plan`. */
+  readonly home: string
+  /** The engine's temp folder, which the engine's own prompt tells the agent to use for scratch files. */
+  readonly tmp: string
+}): ProjectFolders {
+  const checkouts = [dirs.project, dirs.canonical].filter(
+    (dir) => path.resolve(dir) !== path.parse(path.resolve(dir)).root,
+  )
+  const worktrees = dirs.worktrees === undefined ? [] : [dirs.worktrees]
+  return {
+    cwd: dirs.cwd,
+    open: [dirs.cwd, ...checkouts, ...worktrees, path.join(dirs.home, ".opencode", "plan"), dirs.tmp].map((dir) =>
+      realPathOf(path.resolve(dir)),
+    ),
+  }
+}
+
+/** Core's FileAccess.resolvePath, which its session move tool reads a folder with; abucode-config-edit.test.ts compares the two. */
+export function sessionMoveDestination(base: string, directory: string, home: string) {
+  const normalized = FSUtil.windowsPath(directory)
+  if (normalized === "~") return path.resolve(home)
+  if (normalized.startsWith("~/") || (process.platform === "win32" && normalized.startsWith("~\\")))
+    return path.resolve(home, normalized.slice(2))
+  return path.resolve(base, normalized)
+}
+
+/**
+ * The edit permission resources (relative to `cwd` inside the project, absolute outside it, `<machine>:/…` on another
+ * machine) whose write would land outside the project's folders. Where a write lands is read from the disk: links are
+ * followed, a final link whose target does not exist yet included, since writing through it creates that target. So a
+ * link in the project that points outside counts as outside. Another machine's file is always outside.
+ */
+export function editsOutsideProject(resources: readonly string[], folders: ProjectFolders): string[] {
+  return resources.filter((resource) => {
+    // Core's machine path. With its `machines` feature off, a folder in the project named like one asks as well.
+    if (/^(?!local:)[a-z][a-z0-9-]{1,62}:(?:~|\/(?!\/))/.test(resource)) return true
+    const lands = realPathOf(path.resolve(folders.cwd, resource))
+    return !folders.open.some((folder) => FSUtil.contains(folder, lands))
+  })
+}
+
 // A file named opencode.json(c), or anything in a .opencode folder. Windows ignores an NTFS stream suffix (`:...`) and
 // trailing dots and spaces in a name, so they are dropped from every segment.
 function isConfigName(value: string): boolean {
@@ -215,14 +277,25 @@ function isConfigName(value: string): boolean {
 }
 
 // The real path of the deepest folder that resolves, with the rest of the path as written. realpath fails for a missing
-// path and also for a folder that can be searched but not read; that part then stays as written.
-function realPathOf(absolute: string): string {
+// path and also for a folder that can be searched but not read; that part then stays as written. A link whose target
+// does not exist yet is followed too, since writing through it creates that target.
+function realPathOf(absolute: string, links = 0): string {
   try {
     return fs.realpathSync.native(absolute)
   } catch {
     const parent = path.dirname(absolute)
     if (parent === absolute) return absolute
-    return path.join(realPathOf(parent), path.basename(absolute))
+    const real = path.join(realPathOf(parent, links), path.basename(absolute))
+    const target = links < 40 ? linkTarget(real) : undefined
+    return target === undefined ? real : realPathOf(path.resolve(path.dirname(real), target), links + 1)
+  }
+}
+
+function linkTarget(file: string): string | undefined {
+  try {
+    return fs.readlinkSync(file)
+  } catch {
+    return undefined
   }
 }
 

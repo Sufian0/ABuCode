@@ -163,6 +163,11 @@ describe("Phase 4+ — Deep Shell Parser Policy, DNS SSRF Shield & 18-Action pla
       expect(isEngineConfigPath("tools/guard.ts", dirs)).toBe(true)
       expect(isEngineConfigPath(".opencode/command/policy.md", dirs)).toBe(true)
       expect(isEngineConfigPath("src/index.ts", dirs)).toBe(false)
+      // A write through a link to a file that does not exist yet creates that file.
+      fs.symlinkSync(path.join(root, "repo/.opencode/plugins/new.ts"), path.join(root, "repo/notes.md"))
+      fs.symlinkSync(path.join(root, "home/.config/abucode/plugin/new.ts"), path.join(root, "repo/todo.md"))
+      expect(isEngineConfigPath("notes.md", dirs)).toBe(true)
+      expect(isEngineConfigPath("todo.md", dirs)).toBe(true)
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }
