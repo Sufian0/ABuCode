@@ -2,6 +2,7 @@ import { describe, expect } from "bun:test"
 import { existsSync } from "node:fs"
 import path from "path"
 import { Duration, Effect, Layer, LayerMap, Schedule } from "effect"
+import { Agent } from "@opencode/core/agent"
 import { Command } from "@opencode/core/command"
 import { ConfigAgentPlugin } from "@opencode/core/config/plugin/agent"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
@@ -12,6 +13,7 @@ import { LocationServiceMap } from "@opencode/core/location-services"
 import { Plugin } from "@opencode/core/plugin"
 import { SdkPlugins } from "@opencode/core/plugin/sdk"
 import { AbsolutePath } from "@opencode/core/schema"
+import { Skill } from "@opencode/core/skill"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Global } from "@opencode/util/global"
 import { Npm } from "@opencode/util/npm"
@@ -174,6 +176,53 @@ describe("ABuCode plugin guard", () => {
       expect(replaced(listed.boot, "project command")).toEqual([])
       expect(listed.reloaded.find((command) => command.name === "hello")?.description).toBe("changed command")
       expect(replaced(listed.reloaded, "changed command")).toEqual([])
+    }),
+  )
+
+  // gray-matter evaluates front matter that opens with `---js`, and a project's command, agent and skill files are
+  // parsed as soon as the project opens, before anything is asked.
+  it.live("does not run JavaScript front matter in a project's command, agent and skill files", () =>
+    Effect.gen(function* () {
+      const ran = globalThis as unknown as Record<string, unknown>
+      const script = (kind: string) =>
+        `---js\n(() => { globalThis["abucode_front_matter_${kind}"] = true; return { name: "js-${kind}", description: "js ${kind}" } })()\n---\nSay hello.\n`
+      const yaml = (kind: string) => `---\nname: yaml-${kind}\ndescription: yaml ${kind}\n---\nSay hello.\n`
+      const ref = yield* project({
+        ".opencode/agent/js-agent.md": script("agent"),
+        ".opencode/command/js-command.md": script("command"),
+        ".opencode/skill/js-skill/SKILL.md": script("skill"),
+        ".opencode/agent/yaml-agent.md": yaml("agent"),
+        ".opencode/command/yaml-command.md": yaml("command"),
+        ".opencode/skill/yaml-skill/SKILL.md": yaml("skill"),
+      })
+      const locations = yield* LocationServiceMap.Service
+      const loaded = yield* Effect.gen(function* () {
+        const plugins = yield* Plugin.Service
+        const commands = yield* Command.Service
+        const agents = yield* Agent.Service
+        const skills = yield* Skill.Service
+        yield* plugins.awaitActivation
+
+        // The YAML files load, which shows the JavaScript ones were read too.
+        return yield* Effect.all({
+          commands: commands.list().pipe(Effect.map((list) => list.map((command) => command.name))),
+          agents: agents.list().pipe(Effect.map((list) => list.map((agent) => String(agent.id)))),
+          skills: skills.list().pipe(Effect.map((list) => list.map((skill) => String(skill.name)))),
+        }).pipe(
+          Effect.filterOrFail(
+            (names) =>
+              names.commands.includes("yaml-command") &&
+              names.agents.includes("yaml-agent") &&
+              names.skills.includes("yaml-skill"),
+          ),
+          Effect.retry({ times: 200, schedule: Schedule.spaced("25 millis") }),
+        )
+      }).pipe(Effect.scoped, Effect.provide(locations.get(ref)))
+
+      expect(["agent", "command", "skill"].filter((kind) => ran[`abucode_front_matter_${kind}`] === true)).toEqual([])
+      expect(loaded.commands).not.toContain("js-command")
+      expect(loaded.agents).not.toContain("js-agent")
+      expect(loaded.skills).not.toContain("js-skill")
     }),
   )
 })
