@@ -57,6 +57,7 @@ import {
   redactKnownSecrets,
   scrubEnvironmentInPlace,
   secretFileAccessReason,
+  sessionMoveDestination,
   shellConfigWrites,
   systemConfigDirectory,
   validateResolvedFetchUrlGuard,
@@ -83,10 +84,11 @@ const decodeString = Schema.decodeUnknownOption(Schema.String)
 const decodeSquadJson = Schema.decodeUnknownOption(Schema.fromJsonString(ABuCode.SquadSettings))
 // The fields of core's `opencode_session_move` input that say where a session goes.
 const decodeMoveInput = Schema.decodeUnknownOption(
-  Schema.Struct({ sessionID: Schema.optional(Schema.String), directory: Schema.String }),
+  Schema.Struct({ sessionID: Schema.optional(Session.ID), directory: Schema.String }),
 )
-// Marks the `edit` request the session move check makes, so the outside-project hook words its prompt for a move.
-const SESSION_MOVE = "abucode.sessionMove"
+// The permission a move out of the project asks for. It is not `edit`, so an agent whose rules deny edits, such as
+// Plan, is asked rather than refused.
+const SESSION_MOVE = "session-move"
 
 const KEY_DEFAULT_CHARACTER = "global:character"
 const KEY_DEFAULT_POLICY = "global:policy"
@@ -136,15 +138,6 @@ const Unattended = Context.Reference<unknown>("@opencode/Permission/Unattended",
 
 const listFiles = (files: readonly string[]) =>
   files.length > 3 ? `${files.slice(0, 3).join(", ")} and ${files.length - 3} more` : files.join(", ")
-
-// Where core's session move tool sends a session, as its own FileAccess.resolvePath reads the folder it is given.
-function moveDestination(base: string, directory: string, home = Global.Path.home) {
-  const normalized = FSUtil.windowsPath(directory)
-  if (normalized === "~") return path.resolve(home)
-  if (normalized.startsWith("~/") || (process.platform === "win32" && normalized.startsWith("~\\")))
-    return path.resolve(home, normalized.slice(2))
-  return path.resolve(base, normalized)
-}
 
 export default define({
   id: "abucode.core",
@@ -720,21 +713,33 @@ export default define({
       cwd: ctx.location.directory,
       project: ctx.location.project.directory,
       canonical: ctx.location.project.canonical,
-      worktrees: path.join(global.data, "worktree", ctx.location.project.id.slice(0, 6)),
+      // Every repository with neither a remote nor a commit shares the project id `global`, and so its worktree folder.
+      worktrees:
+        ctx.location.project.id === "global"
+          ? undefined
+          : path.join(global.data, "worktree", ctx.location.project.id.slice(0, 6)),
       home: global.home,
       tmp: global.tmp,
     })
 
-    // Registered after the config check, which already holds any request that also edits engine config. Like that
-    // check it asks even where permission rules allow the edit, and asks each time.
+    // Registered after the config check. Like that check it asks even where permission rules allow the edit, and asks
+    // each time. A request the config check already holds only has its files outside the project added to the prompt.
     yield* ctx.permission.hook("evaluate", (event) =>
       Effect.gen(function* () {
-        if (event.action !== "edit" || event.effect === "deny") return
-        if (event.resources.some((resource) => isEngineConfigPath(resource, configDirs))) return
-        const files = editsOutsideProject(event.resources, projectDirs)
+        if ((event.action !== "edit" && event.action !== SESSION_MOVE) || event.effect === "deny") return
+        const config =
+          event.action === "edit" ? event.resources.filter((resource) => isEngineConfigPath(resource, configDirs)) : []
+        const files = editsOutsideProject(
+          event.resources.filter((resource) => !config.includes(resource)),
+          projectDirs,
+        )
         if (files.length === 0) return
         const named = listFiles(files)
-        const move = event.metadata?.[SESSION_MOVE] === true
+        if (config.length > 0) {
+          event.message = `${event.message} It also edits outside this project: ${named}`
+          return
+        }
+        const move = event.action === SESSION_MOVE
         if ((yield* Unattended) !== undefined) {
           event.effect = "deny"
           event.message = move
@@ -755,9 +760,9 @@ export default define({
     )
 
     // A session moved to another folder treats that folder as its project, where edits no longer ask. So a move out of
-    // the project asks for `edit` on the destination, which the hook above asks or refuses for. A move into one of the
-    // project's own checkouts, such as a worktree the engine made, does not ask. Code Mode programs and automations call
-    // the same tool as `tools.opencode.session.move`; its name can reach here in either spelling.
+    // the project asks for SESSION_MOVE on the destination, which the hook above asks or refuses for. A move into one of
+    // the project's own checkouts, such as a worktree the engine made, does not ask. Code Mode programs and automations
+    // call the same tool as `tools.opencode.session.move`; its name can reach here in either spelling.
     yield* ctx.tool.hook("execute.before", (event) =>
       Effect.gen(function* () {
         if (event.tool.replaceAll(".", "_") !== "opencode_session_move") return
@@ -765,16 +770,16 @@ export default define({
         // Input the tool would reject never moves anything.
         if (!input) return
         const session = yield* ctx.session
-          .get({ sessionID: Session.ID.make(input.sessionID ?? event.sessionID) })
+          .get({ sessionID: input.sessionID ?? event.sessionID })
           .pipe(
             Effect.mapError(() => new Tool.Error({ message: "ABuCode could not check where this session would move" })),
           )
-        const directory = moveDestination(session.location.directory, input.directory.trim())
+        const directory = sessionMoveDestination(session.location.directory, input.directory.trim(), Global.Path.home)
         if (editsOutsideProject([directory], projectDirs).length === 0) return
         yield* ctx.permission.assert({
-          action: "edit",
+          action: SESSION_MOVE,
           resources: [directory.replaceAll("\\", "/")],
-          metadata: { [SESSION_MOVE]: true, input: { directory: input.directory } },
+          metadata: { input: { directory: input.directory } },
           sessionID: event.sessionID,
           agent: event.agent,
           source: { type: "tool", messageID: event.messageID, id: event.id },

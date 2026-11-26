@@ -24,8 +24,9 @@ describe("edits outside the session's project", () => {
       ".",
       // Core's catch-all resource, which automations check their grants with.
       "*",
-      // How core names a local folder that reads like a machine path.
+      // How core names a local folder that reads like a machine path; `local` is never a machine.
       "./gpu:/notes.md",
+      "local:/notes.md",
       at("u/repo/lib/index.ts"),
       at("u/main/src/index.ts"),
       at("u/.local/share/abucode/worktree/abc123/task/src/index.ts"),
@@ -53,6 +54,9 @@ describe("edits outside the session's project", () => {
     expect(editsOutsideProject([at("u/.zshenv")], projectFolders({ ...dirs, project: root, canonical: root }))).toEqual(
       [at("u/.zshenv")],
     )
+    // A project without a worktree folder of its own, such as one with the shared id `global`, asks for any worktree.
+    const worktree = at("u/.local/share/abucode/worktree/abc123/task/index.ts")
+    expect(editsOutsideProject([worktree], projectFolders({ ...dirs, worktrees: undefined }))).toEqual([worktree])
   })
 
   // Windows needs extra rights to create a symbolic link.

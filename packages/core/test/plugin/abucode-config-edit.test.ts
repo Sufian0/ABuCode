@@ -22,7 +22,7 @@ import { Tool } from "@opencode/core/tool"
 import { OpenCodeTools } from "@opencode/core/tool/plugin/opencode"
 import { ShellTool } from "@opencode/core/tool/plugin/shell"
 import { WorktreeStrategies } from "@opencode/core/worktree/strategies"
-import { systemConfigDirectory } from "@opencode/plugin-abucode/security"
+import { sessionMoveDestination, systemConfigDirectory } from "@opencode/plugin-abucode/security"
 import { AbsolutePath } from "@opencode/schema/schema"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Global } from "@opencode/util/global"
@@ -165,6 +165,17 @@ describe("ABuCode config edit guard", () => {
 
     expect(platforms.map((platform) => systemConfigDirectory(platform, env))).toEqual(
       platforms.map((platform) => ConfigDiscovery.systemDirectory(platform, env)),
+    )
+  })
+
+  // The plugin keeps a copy of how core's session move tool reads the folder it is given.
+  test("reads a session move's folder as core's move tool does", () => {
+    const base = path.resolve("/work/repo")
+    const home = path.resolve("/home/user")
+    const folders = ["~", "~/other", "../sibling", "sub/folder", "/elsewhere", "~user", "C:/work", "/c/work"]
+
+    expect(folders.map((folder) => sessionMoveDestination(base, folder, home))).toEqual(
+      folders.map((folder) => FileAccess.resolvePath(base, folder, home)),
     )
   })
 
@@ -369,7 +380,12 @@ const outsideAsked = {
 }
 
 const moveAsked = {
-  asks: [{ action: "edit", message: expect.stringMatching(/^ABuCode asks before a session moves out of its project/) }],
+  asks: [
+    {
+      action: "session-move",
+      message: expect.stringMatching(/^ABuCode asks before a session moves out of its project/),
+    },
+  ],
   writtenWhileAsking: false,
   rejected: true,
 }
@@ -529,6 +545,50 @@ describe("ABuCode outside-project edit guard", () => {
     }),
   )
 
+  it.live("names the files outside the project in the config prompt of a patch that also edits config", () =>
+    Effect.gen(function* () {
+      const directory = (yield* tmpdirScoped()).path
+      const result = yield* inSession(directory, (_files, context) =>
+        Effect.gen(function* () {
+          const global = yield* Global.Service
+          const registry = yield* Tool.Service
+          const file = path.join(global.home, ".zshenv")
+          const patchText = [
+            "*** Begin Patch",
+            "*** Add File: opencode.json",
+            "+{}",
+            `*** Add File: ${file}`,
+            "+export PATH=/tmp/probe:$PATH",
+            "*** End Patch",
+          ].join("\n")
+
+          return yield* rejectRequests(
+            context,
+            file,
+            executeTool(registry, {
+              sessionID: context.sessionID,
+              agent: context.agent,
+              messageID: context.messageID,
+              call: { type: "tool-call", id: context.id, name: "patch", input: { patchText } },
+            }),
+          )
+        }),
+      )
+
+      expect(result).toEqual({
+        ...asked,
+        asks: [
+          {
+            action: "edit",
+            message: expect.stringMatching(
+              /^ABuCode asks before any edit to engine config,.*: opencode\.json It also edits outside this project: \S+\/\.zshenv$/,
+            ),
+          },
+        ],
+      })
+    }),
+  )
+
   it.live(
     "lets edits reach the engine's temp folder and the plan folder, and asks for the rest of the temp folder",
     () =>
@@ -623,6 +683,45 @@ describe("ABuCode outside-project edit guard", () => {
       )
 
       expect(result).toEqual({ into: true, pending: 0, away: moveAsked })
+    }),
+  )
+
+  // Plan's rules deny edits outside its plan folder; a move is its own permission, so Plan is asked, not refused.
+  it.live("asks the Plan agent too before it moves a session out of its project", () =>
+    Effect.gen(function* () {
+      const directory = (yield* tmpdirScoped()).path
+      const result = yield* inSession(
+        directory,
+        (_files, context) =>
+          rejectRequests(
+            context,
+            path.join(directory, "never-written"),
+            toolHook(context, "opencode_session_move", { directory: "~" }),
+          ),
+        Agent.ID.make("plan"),
+      )
+
+      expect(result).toEqual(moveAsked)
+    }),
+  )
+
+  // The tool's input is checked after the plugins' hooks run, so the hook sees whatever the model sent.
+  it.live("leaves a move with an invalid session id to the tool's own input check", () =>
+    Effect.gen(function* () {
+      const directory = (yield* tmpdirScoped()).path
+      const result = yield* inSession(directory, (_files, context) =>
+        Effect.gen(function* () {
+          const permission = yield* Permission.Service
+          const exit = yield* toolHook(context, "opencode_session_move", { sessionID: "abc", directory: "~" }).pipe(
+            Effect.timeout("5 seconds"),
+            Effect.exit,
+          )
+
+          return { passedOn: Exit.isSuccess(exit), pending: (yield* permission.forSession(context.sessionID)).length }
+        }),
+      )
+
+      expect(result).toEqual({ passedOn: true, pending: 0 })
     }),
   )
 

@@ -224,7 +224,7 @@ export function projectFolders(dirs: {
   /** The repository's main checkout. */
   readonly canonical: string
   /** Core's default worktree folder for the project; abucode-config-edit.test.ts fails if the two differ. */
-  readonly worktrees: string
+  readonly worktrees?: string
   /** The user's home folder; the Plan agent writes its plans in `<home>/.opencode/plan`. */
   readonly home: string
   /** The engine's temp folder, which the engine's own prompt tells the agent to use for scratch files. */
@@ -233,12 +233,22 @@ export function projectFolders(dirs: {
   const checkouts = [dirs.project, dirs.canonical].filter(
     (dir) => path.resolve(dir) !== path.parse(path.resolve(dir)).root,
   )
+  const worktrees = dirs.worktrees === undefined ? [] : [dirs.worktrees]
   return {
     cwd: dirs.cwd,
-    open: [dirs.cwd, ...checkouts, dirs.worktrees, path.join(dirs.home, ".opencode", "plan"), dirs.tmp].map((dir) =>
+    open: [dirs.cwd, ...checkouts, ...worktrees, path.join(dirs.home, ".opencode", "plan"), dirs.tmp].map((dir) =>
       realPathOf(path.resolve(dir)),
     ),
   }
+}
+
+/** Core's FileAccess.resolvePath, which its session move tool reads a folder with; abucode-config-edit.test.ts compares the two. */
+export function sessionMoveDestination(base: string, directory: string, home: string) {
+  const normalized = FSUtil.windowsPath(directory)
+  if (normalized === "~") return path.resolve(home)
+  if (normalized.startsWith("~/") || (process.platform === "win32" && normalized.startsWith("~\\")))
+    return path.resolve(home, normalized.slice(2))
+  return path.resolve(base, normalized)
 }
 
 /**
@@ -249,7 +259,8 @@ export function projectFolders(dirs: {
  */
 export function editsOutsideProject(resources: readonly string[], folders: ProjectFolders): string[] {
   return resources.filter((resource) => {
-    if (/^[a-z][a-z0-9-]{1,62}:(?:~|\/(?!\/))/.test(resource)) return true
+    // Core's machine path. With its `machines` feature off, a folder in the project named like one asks as well.
+    if (/^(?!local:)[a-z][a-z0-9-]{1,62}:(?:~|\/(?!\/))/.test(resource)) return true
     const lands = realPathOf(path.resolve(folders.cwd, resource))
     return !folders.open.some((folder) => FSUtil.contains(folder, lands))
   })
