@@ -12,6 +12,7 @@ import { hasMcpClientTicketURL } from "@opencode/protocol/groups/mcp"
 import { isMachineLinkUpgrade } from "@opencode/protocol/groups/machine"
 import { isPairingConnectURL } from "@opencode/protocol/groups/server"
 import { Global } from "@opencode/util/global"
+import { ServerAddress } from "@opencode/util/server-address"
 import { Cause, Context, Effect, Exit, Latch, Layer, Option, Ref, Scope } from "effect"
 import { HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
 import { NetAddress } from "effect/net"
@@ -70,6 +71,11 @@ export const start = Effect.fn("ServerProcess.start")(function* <E, R>(
     return ServerInfo.connectionURLs(`http://${host}:${address.port}`, hostname)
   }
   const urls = () => [...localURLs(), ...(remoteURLs?.() ?? [])]
+  // ABuCode: the ABuCode plugin refuses the agent's own requests to these URLs and masks the password.
+  yield* Effect.acquireRelease(
+    Effect.sync(() => ServerAddress.register(urls, password)),
+    (unregister) => Effect.sync(unregister),
+  )
   const application = yield* Ref.make(Option.none<App>())
   // Off until the routes are up, which is when the flag can be read.
   const machinesFlag = yield* Ref.make(Effect.succeed(false))

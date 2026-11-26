@@ -892,21 +892,34 @@ function buildRoleSystemPrompt(spec: AgentSpec): string {
   ].join("\n")
 }
 
+/**
+ * What the plugin keeps from a subagent, whose tools and model requests the engine's hooks do not see: `refuse` says
+ * why a path may not be read (`read`) or searched (`search`), and `mask` hides secrets in what it sends to its model.
+ */
+export interface SubagentGuard {
+  readonly refuse: (target: string, mode: "read" | "search") => string | undefined
+  readonly mask: (text: string) => string
+}
+
 function executeReadOnlyRepoTool(
   repoRoot: string,
   toolName: string,
   args: Record<string, unknown>,
   referencedFiles: Set<string>,
+  guard?: SubagentGuard,
 ): string {
   const rootResolved = path.resolve(repoRoot)
-  const resolveInsideRepo = (relPath: string): { ok: true; full: string; rel: string } | { ok: false; err: string } => {
+  const resolveInsideRepo = (
+    relPath: string,
+    mode: "read" | "search" = "read",
+  ): { ok: true; full: string; rel: string } | { ok: false; err: string } => {
     const clean = relPath.trim() || "."
     const target = path.resolve(rootResolved, clean)
     const rel = path.relative(rootResolved, target).replaceAll("\\", "/")
     if (rel.startsWith("..") || path.isAbsolute(rel)) {
       return { ok: false, err: `Path '${relPath}' is outside the repository root.` }
     }
-    const secretBlock = secretFileAccessReason(target)
+    const secretBlock = secretFileAccessReason(target) ?? guard?.refuse(target, mode)
     if (secretBlock) return { ok: false, err: secretBlock }
     return { ok: true, full: target, rel: rel || "." }
   }
@@ -955,7 +968,7 @@ function executeReadOnlyRepoTool(
   if (toolName === "search_files") {
     const query = String(args.query ?? "").trim()
     if (!query) return "search_files requires a non-empty 'query'."
-    const check = resolveInsideRepo(String(args.path ?? "."))
+    const check = resolveInsideRepo(String(args.path ?? "."), "search")
     if (!check.ok) return check.err
     try {
       const res = childProcess.spawnSync(
@@ -1208,9 +1221,18 @@ const defaultAgentLlmCaller: AgentLlmCaller = async (req) => {
 
 export async function runSquadAgent(
   spec: AgentSpec,
-  opts?: { readonly llmCaller?: AgentLlmCaller },
+  opts?: { readonly llmCaller?: AgentLlmCaller; readonly guard?: SubagentGuard },
 ): Promise<AgentResult> {
-  const caller = opts?.llmCaller ?? defaultAgentLlmCaller
+  const base = opts?.llmCaller ?? defaultAgentLlmCaller
+  const guard = opts?.guard
+  const caller: AgentLlmCaller =
+    guard === undefined
+      ? base
+      : (request) =>
+          base({
+            ...request,
+            messages: request.messages.map((message) => ({ ...message, content: guard.mask(message.content) })),
+          })
   const sem = getProviderSemaphore(spec.provider)
   const release = await sem.acquire()
 
@@ -1272,7 +1294,7 @@ export async function runSquadAgent(
           continue
         }
 
-        const out = executeReadOnlyRepoTool(spec.repo, call.name, call.arguments, referencedFiles)
+        const out = executeReadOnlyRepoTool(spec.repo, call.name, call.arguments, referencedFiles, guard)
         toolOutputs.push(`<tool_result name="${call.name}">\n${out}\n</tool_result>`)
       }
 
@@ -1407,7 +1429,7 @@ export function formatWorkflowDigest(
 export async function executeSquadWorkflow(
   plan: CompiledWorkflow,
   reportStore: AgentReportStore,
-  opts?: { readonly llmCaller?: AgentLlmCaller },
+  opts?: { readonly llmCaller?: AgentLlmCaller; readonly guard?: SubagentGuard },
 ): Promise<{ readonly digest: string; readonly totalAgentsRun: number }> {
   // Stage 1: Scouts in parallel
   const scoutResults = await Promise.all(plan.scouts.map((spec) => runSquadAgent(spec, opts)))
@@ -1490,6 +1512,7 @@ export async function runHouseholdSubagents(
     readonly budget?: TurnAgentBudget
     readonly reportStore?: AgentReportStore
     readonly llmCaller?: AgentLlmCaller
+    readonly guard?: SubagentGuard
   },
 ): Promise<{ readonly count: number; readonly report: string }> {
   const rawList =
@@ -1530,7 +1553,9 @@ export async function runHouseholdSubagents(
     }
   })
 
-  const results = await Promise.all(specs.map((spec) => runSquadAgent(spec, { llmCaller: opts.llmCaller })))
+  const results = await Promise.all(
+    specs.map((spec) => runSquadAgent(spec, { llmCaller: opts.llmCaller, guard: opts.guard })),
+  )
   for (const r of results) {
     opts.reportStore?.put(r)
   }
