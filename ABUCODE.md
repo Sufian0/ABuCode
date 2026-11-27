@@ -4,16 +4,17 @@
 
 ## Running ABuCode
 
-All modes connect to the same isolated `abucode` local background engine and SQLite store (`~/.local/share/abucode` / `~/.config/abucode`), leaving stock `opencode` and `MultiCode` completely untouched:
+All modes use the same isolated `abucode` SQLite store and settings (`~/.local/share/abucode` / `~/.config/abucode`), leaving stock `opencode` and `MultiCode` completely untouched. The desktop app runs a background engine of its own beside the terminal's (see "The desktop app's engine" below):
 
 * **Terminal CLI / TUI (Windows):** `.\abucode.cmd [project-path]` *(or `node packages\cli\bin\abucode.cjs`)*
 * **Terminal CLI / TUI (macOS/Linux):** `./abucode.sh [project-path]`
 * **Web GUI:** `.\abucode_web.cmd` *(or `bun run dev:web`)*
-* **Dedicated Desktop App (Electron + Tray + `Alt+Space` Summon):** `.\abucode_desktop.cmd` *(or `bun run dev:desktop`; pass `-- --minimized` to start hidden in tray)*
+* **Dedicated Desktop App (Electron + Tray + `Alt+Space` Summon, Windows):** `.\abucode_desktop.cmd` *(or `bun run dev:desktop`; pass `-- --minimized` to start hidden in tray)*
+* **Dedicated Desktop App (macOS/Linux):** `./abucode_desktop.sh`
 
 ## Experimental features
 
-OpenCode turns most of its experimental features on in anything run from source, which is how ABuCode runs. The launchers (`abucode.cmd`, `abucode.sh`, `abucode_desktop.cmd` and `packages/cli/bin/abucode.cjs`) therefore start the engine with those switched off, by putting this in `OPENCODE_FLAGS`:
+OpenCode turns most of its experimental features on in anything run from source, which is how ABuCode runs. The launchers (`abucode.cmd`, `abucode.sh`, `abucode_desktop.cmd`, `abucode_desktop.sh` and `packages/cli/bin/abucode.cjs`) therefore start the engine with those switched off, by putting this in `OPENCODE_FLAGS`:
 
 ```
 -full_codemode,-home_memory,-project_overlay,-machines,-media_blob,-artifacts,-sqlite_fts,-console_watches,-recommended_api,-opencode_api
@@ -23,10 +24,26 @@ OpenCode turns most of its experimental features on in anything run from source,
 
 * **To try one,** name it in `OPENCODE_FLAGS` before you start ABuCode: `$env:OPENCODE_FLAGS = "artifacts"` in PowerShell, `set OPENCODE_FLAGS=artifacts` in cmd, or `OPENCODE_FLAGS=artifacts ./abucode.sh`. The launcher puts your entries after its own, and a later entry for the same feature wins. `all` does not override the list.
 * **`experimental.<name>: true` in a config file does not turn a listed feature on,** because `OPENCODE_FLAGS` outranks config.
-* **The engine reads the flags once, when it starts, and the terminal launcher reuses an engine that is already running.** An engine started any other way, or before the launchers had this list, keeps its own flags. Run `.\abucode.cmd service stop` once after updating, after any `bun run dev`, and before changing flags.
-* **Do not set `OPENCODE_FLAGS` with `service set env`.** A saved value replaces the launcher's list, which turns every feature it does not name back on.
-* **Only the launchers do this.** `bun run dev` and `bun run dev:desktop` carry no list, so an engine they start has the default-on features on. That includes the desktop app on macOS and Linux, which has no launcher. A WSL server added inside the desktop app does not get the list either. `abucode_web.cmd` and `bun run dev:web` start no engine of their own.
-* **After merging a newer OpenCode, or editing a launcher,** run `bun run script/test.ts test/abucode-launchers.test.ts test/plugin/abucode-guard.test.ts test/plugin/abucode-config-edit.test.ts` in `packages/core`. The first file fails if the release added a feature the launchers do not yet switch off: add it to the list in all four and in the block above. The other two fail if the merge drops the ABuCode id from the protected list, removes the reserved-id check, changes how file edits ask for permission, renames core's unattended marker, moves the system config folder, or renames the shell tool or its `command` and `workdir` fields (next section). They do not check that `OPENCODE_CONFIG` still names the config file.
+* **The engine reads the flags once, when it starts, and the terminal launcher reuses an engine that is already running.** An engine started any other way, or before the launchers had this list, keeps its own flags. Run `.\abucode.cmd service stop` once after updating, after any `bun run dev`, and before changing flags. That command does not reach the desktop app's engine, which is stopped another way (next section).
+* **Do not set `OPENCODE_FLAGS` with `service set env`.** A saved value replaces the launcher's list, which turns every feature it does not name back on. So does an `OPENCODE_FLAGS` exported from a shell profile, for the desktop app on macOS and Linux: the app reads your login shell's environment over the launcher's.
+* **Only the launchers do this.** `bun run dev` and `bun run dev:desktop` carry no list, so an engine they start has the default-on features on. A WSL server added inside the desktop app does not get the list either. `abucode_web.cmd` and `bun run dev:web` start no engine of their own.
+* **After merging a newer OpenCode, or editing a launcher,** run `bun run script/test.ts test/abucode-launchers.test.ts test/plugin/abucode-guard.test.ts test/plugin/abucode-config-edit.test.ts` in `packages/core`. The first file fails if the release added a feature the launchers do not yet switch off: add it to the list in all five and in the block above. The other two fail if the merge drops the ABuCode id from the protected list, removes the reserved-id check, changes how file edits ask for permission, renames core's unattended marker, moves the system config folder, or renames the shell tool or its `command` and `workdir` fields (the plugin section below). They do not check that `OPENCODE_CONFIG` still names the config file.
+
+## The desktop app's engine
+
+The desktop app does not share the terminal's engine. It starts one of its own on port 3084 and registers it in the app's profile folder, which is why `service stop` in the section above does not find it. Both engines use the same store and settings.
+
+* **It listens on this computer only** (`127.0.0.1`). OpenCode starts this engine on every network interface, which left an engine that runs shell commands reachable from the local network and the tailnet, behind a password sent over plain http. The app itself does not need that: its Pair dialog goes through the remote tunnel.
+* **To put it back on the network,** start the app with `ABUCODE_DESKTOP_EXPOSE_SERVER=1`: `ABUCODE_DESKTOP_EXPOSE_SERVER=1 ./abucode_desktop.sh`, or `$env:ABUCODE_DESKTOP_EXPOSE_SERVER = "1"` in PowerShell (`set "ABUCODE_DESKTOP_EXPOSE_SERVER=1"` in cmd) before `.\abucode_desktop.cmd`. Only the exact value `1` counts, and on Windows it stays set for that terminal window. Other devices can then open `http://<this computer>:3084`, and the password crosses the network unencrypted.
+* **Remote access is a separate switch.** While it is on, an engine is also published through the remote tunnel, whatever address it listens on. `service get remote` shows it, and the setting is shared with the terminal's engine.
+* **The engine keeps running after you quit the app.** Closing the window only hides the app, so quit from the tray's Quit ABuCode item (or Cmd+Q on macOS). Then delete the engine's registration file, and the engine exits within about five seconds:
+  * macOS: `rm "$HOME/Library/Application Support/ai.abucode.desktop.dev/abucode/service-local.json"`
+  * Linux: `rm "${XDG_CONFIG_HOME:-$HOME/.config}/ai.abucode.desktop.dev/abucode/service-local.json"`
+  * Windows: `Remove-Item "$env:APPDATA\ai.abucode.desktop.dev\abucode\service-local.json"` in PowerShell, or `del "%APPDATA%\ai.abucode.desktop.dev\abucode\service-local.json"` in cmd
+
+  If the file is not there, no engine is registered. To stop the engine at once instead, run `service stop` with `XDG_STATE_HOME` set to that `ai.abucode.desktop.dev` folder for the one command: `XDG_STATE_HOME="$HOME/Library/Application Support/ai.abucode.desktop.dev" ./abucode.sh service stop` on macOS. It prints nothing either way, so run the same line with `service status` first: that prints the engine's address, or `stopped`.
+* **Starting the app again replaces the engine,** with the flags and the address of that start, but only after a real quit. While the app sits in the tray, starting it again just brings its window back. After updating to a version with this change, quit the app and stop its engine once.
+* **After merging a newer OpenCode,** check that `packages/desktop/src/main/service/background-service.ts` still takes the engine's address from `isolatedHostname`. No test reads that line. `bun test src/main/service/isolated-hostname.test.ts` in `packages/desktop` only covers what the switch means.
 
 ## The ABuCode plugin cannot be switched off from config
 
@@ -34,7 +51,7 @@ ABuCode's server plugin, `abucode.core`, enforces the policy tiers and the secre
 
 * **A plugin loaded from config cannot take its id either.** The engine does not activate such a plugin and lists it as failed with "Plugin ID abucode.core is reserved for a built-in plugin". Its code is still imported to read the id.
 * **The agent asks before it edits engine config.** That is any file named `opencode.json` or `opencode.jsonc`, anything in a `.opencode` folder, anything in the global config folder (`~/.config/abucode`, or `OPENCODE_CONFIG_DIR` when set) or the system config folder, and the file `OPENCODE_CONFIG` names. Theme and doc files in those places count too. An edit to them by a file tool waits for your approval in every Policy tier, even where your permission rules allow it; a rule that denies the edit still denies it. Links to files and folders that already exist, and other spellings of them, are followed. The Plan agent's `~/.opencode/plan` folder is left out, except for an `opencode.json` or a `.opencode` folder inside it.
-* **In unattended work, such as an automation run, such an edit is refused.** Nobody is there to approve it, so the edit fails. The experimental home memory's daily skill upkeep (on under `bun run dev` and the desktop app on macOS and Linux) does not count as unattended: its skill edits wait for approval in a session you do not see.
+* **In unattended work, such as an automation run, such an edit is refused.** Nobody is there to approve it, so the edit fails. The experimental home memory's daily skill upkeep (on under `bun run dev` and `bun run dev:desktop`) does not count as unattended: its skill edits wait for approval in a session you do not see.
 * **Auto-approval answers this prompt like any other.** `run --auto`, the terminal's auto-accept mode and the app's auto-approve setting approve it without showing it to you.
 * **Choosing Always in that prompt does not stop the next one.** As on any edit prompt, it also saves an allow for every other file edit in this project's sessions, including files outside the project folder.
 * **The agent's shell commands also ask, in every Policy tier, when they visibly write those files.** That covers the agent's shell tool and `playtest_url`'s `start_command`: output redirection (`>`, `>>`, `>|`, `>& file`), `tee`, `cp`, `mv`, `install`, `ln`, `touch`, `sed -i` and `perl -i`, `dd of=`, `curl -o` and `wget -O` or `-P`, and archives unpacked with `tar` or `unzip`, also inside `sh -c`, `eval`, `$(…)` and `xargs`. On Windows, PowerShell's write cmdlets and their usual aliases count too. Each file is resolved against the folder its command runs in, after the shell tool's `workdir` and any `cd`, and a download or unpacked archive into a config folder counts. `~`, `$HOME` and other variables in file names are expanded from the engine's own environment. The prompt names the files (the app also shows the command), it offers no Always that sticks, and where the Policy tier asks about the command too, a second prompt follows.

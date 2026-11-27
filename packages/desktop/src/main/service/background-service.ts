@@ -9,6 +9,7 @@ import { BackgroundServiceMachine } from "./background-service-machine"
 import { cleanStages } from "./cli-stages"
 import { keptStages, serviceVersion, shouldRetryEnsure } from "./cli-version"
 import { DesktopCli } from "./desktop-cli"
+import { isolatedHostname } from "./isolated-hostname"
 import { SidecarCredentials } from "./sidecar-credentials"
 import { takeSidecarProbe } from "./sidecar-probe"
 
@@ -68,7 +69,10 @@ const ensure = Effect.fn("BackgroundService.ensure")(function* (mode: Background
         ...setup.cli.command,
         "serve",
         "--service",
-        ...(setup.isolated ? ["--hostname", "0.0.0.0", "--port", String(0x0c0c)] : []),
+        // ABuCode: this computer only unless asked for; upstream passes 0.0.0.0 here. See ./isolated-hostname.
+        ...(setup.isolated
+          ? ["--hostname", isolatedHostname(process.env.ABUCODE_DESKTOP_EXPOSE_SERVER), "--port", String(0x0c0c)]
+          : []),
       ],
       onStart: (reason, previousVersion) =>
         runFork(Effect.logInfo("v2 CLI background service starting", { reason, previousVersion })),
