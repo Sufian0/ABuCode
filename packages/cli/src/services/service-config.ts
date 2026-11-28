@@ -211,6 +211,18 @@ export const remote = Effect.fn("cli.service-config.remote")(function* () {
   return next
 })
 
+// ABuCode: completes once the saved settings stop naming this route, so that turning remote access off closes the
+// tunnel of every engine that shares them. The desktop app's engine and the terminal's do, but a command stops only the
+// engine registered where it runs. A missing or unreadable file counts as off, as it would for an engine starting now.
+// Checked every 5 seconds, like the registration, without a trace span per check.
+export const remoteTurnedOff = Effect.fnUntraced(function* (route: string) {
+  yield* read().pipe(
+    Effect.repeat({ schedule: Schedule.spaced("5 seconds"), until: (saved) => saved.remote?.route !== route }),
+    Effect.withTracerEnabled(false),
+  )
+  yield* Effect.logInfo("remote access was turned off; closing this engine's tunnel")
+})
+
 export const get = Effect.fn("cli.service-config.get")(function* (key?: string, name?: string) {
   if (key === undefined) {
     const { password: _password, ...safe } = yield* read()
