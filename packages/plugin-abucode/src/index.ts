@@ -11,6 +11,7 @@ import {
   type SquadRoleName,
   type SquadSettings,
 } from "@opencode/schema/abucode"
+import { Automation } from "@opencode/schema/automation"
 import { AbsolutePath } from "@opencode/schema/schema"
 import { Session } from "@opencode/schema/session"
 import { Tool } from "@opencode/schema/tool"
@@ -56,6 +57,7 @@ import {
   scrubEnvironmentInPlace,
   secretFileAccessReason,
   shellConfigWrites,
+  showHiddenCharacters,
   systemConfigDirectory,
   validateResolvedFetchUrlGuard,
 } from "./security.js"
@@ -672,6 +674,147 @@ export default define({
       })
     }
 
+    // An automation runs its shell command or its script later, on a schedule, with nobody there to approve it, so a
+    // person is shown it before it exists. This hook asks about the whole command or script as the request's resource;
+    // core's own requests name only the command's parts, or `*` for a script. Characters that would not show are
+    // spelled out, because only the app's dock does that itself. The request names the calling message, so that core
+    // declines it with the step's other prompts, but no tool call of it, so that the terminal shows its resource rather
+    // than what the calling tool's input says. It is marked the way core marks its own for an automation
+    // (AutomationShell.authorize, AutomationCode.authorize), so the hook below settles both.
+    const decodeAutomation = Schema.decodeUnknownOption(Automation.Request)
+    // The commands and scripts a person approved in that prompt, per session, for the message that is creating them.
+    const approvedAutomations = new Map<string, { readonly messageID: string; readonly texts: Set<string> }>()
+    yield* ctx.tool.hook("execute.before", (event) =>
+      Effect.gen(function* () {
+        // The tool's name in the model's list, and its Code Mode path, which core also accepts as a call.
+        if (event.tool !== "automation_create" && event.tool !== "automation.create") return
+        const request = Option.getOrUndefined(decodeAutomation(event.input))
+        if (request === undefined || request.action.type === "prompt") return
+        const text = request.action.type === "shell" ? request.action.command : request.action.code
+        yield* ctx.permission.assert({
+          sessionID: event.sessionID,
+          agent: event.agent,
+          source: { type: "tool", messageID: event.messageID, id: `${event.id}:abucode-automation` },
+          action: request.action.type === "shell" ? "shell" : "execute",
+          resources: [showHiddenCharacters(text)],
+          metadata: {
+            automation: request.name,
+            trigger: request.trigger,
+            unattended: true,
+            whole: true,
+            ...(request.action.type === "shell" ? { command: text } : { code: text }),
+          },
+        })
+        const approved = approvedAutomations.get(event.sessionID)
+        const texts = approved?.messageID === event.messageID ? approved.texts : new Set<string>()
+        approvedAutomations.set(event.sessionID, { messageID: event.messageID, texts: texts.add(text) })
+      }),
+    )
+    // Core's request follows inside the same call. A call in the same step that is still running is asked again.
+    yield* ctx.tool.hook("execute.after", (event) =>
+      Effect.sync(() => {
+        if (event.tool === "automation_create" || event.tool === "automation.create")
+          approvedAutomations.delete(event.sessionID)
+      }),
+    )
+
+    // Every request for an automation's command or script: the one above, marked `whole`, and core's own. The one above
+    // asks in every Policy tier, also where permission rules allow it. So does core's request for the command (`shell`)
+    // or for running the script (`execute`) when no person approved that text above, as when this plugin finished
+    // loading between the two. A command is read whole and refused when it is on the never-permitted list or visibly
+    // writes engine config, which its runs must not do. core/test/plugin/abucode-automation.test.ts fails if core stops
+    // marking its requests this way, or renames the tool.
+    yield* ctx.permission.hook("evaluate", (event) =>
+      Effect.gen(function* () {
+        if (event.metadata?.unattended !== true || event.effect === "deny") return
+        const command = typeof event.metadata.command === "string" ? event.metadata.command : undefined
+        const text = command ?? (typeof event.metadata.code === "string" ? event.metadata.code : undefined)
+        if (text === undefined) return
+        const refuse = (message: string) => {
+          event.effect = "deny"
+          event.message = message
+        }
+        const settings = yield* buildSessionSettings(event.sessionID)
+        const rating =
+          command === undefined
+            ? undefined
+            : evaluateShellPolicyDecision(settings.policy, command, "allow", configDirs.cwd)
+        if (rating?.effect === "deny") return refuse(rating.message ?? "Blocked: this command is never permitted.")
+        const writes =
+          command === undefined
+            ? []
+            : shellConfigWrites(command, configDirs, { powershell: process.platform === "win32" })
+        if (writes.length > 0)
+          return refuse(
+            `ABuCode refuses an automation whose command writes engine config, because it would run with nobody there to approve the edit: ${writes.join(", ")}`,
+          )
+        // Core's HTTP route creates automations with nobody there to ask, and settles an ask from the rules alone.
+        if ((yield* Unattended) !== undefined) return
+        const approved = approvedAutomations.get(event.sessionID)
+        const seen =
+          approved !== undefined && approved.messageID === event.source?.messageID && approved.texts.has(text)
+        const own = event.action === (command === undefined ? "execute" : "shell")
+        const whole = event.metadata.whole === true
+        const raised = event.effect !== "ask" && (whole || (own && !seen))
+        if (raised) event.effect = "ask"
+        // Core's own request that asks for another reason, such as the Policy tier's, keeps that prompt's message.
+        if (event.effect !== "ask" || !(whole || raised)) return
+        // The tier's rating of the whole command, and what an earlier hook said about the request, follow the reason.
+        event.message = [
+          `ABuCode asks before an automation is created to run this ${command === undefined ? "script" : "shell command"} on its own later, with nobody there to approve it.`,
+          ...new Set([rating?.effect === "ask" ? rating.message : undefined, event.message]),
+        ]
+          .filter(Boolean)
+          .join(" ")
+        if (raised) yield* notifyApprovalNeeded(event.sessionID, "⏸ Approve an automation · ABuCode", event.message)
+      }),
+    )
+
+    // In unattended work core settles an ask from the rules and the work's own grant, so the approval an automation got
+    // when it was created would also answer the Policy tier's question about each command its script runs. The command
+    // is rated here as if the rules allowed it: what the tier itself would ask about is refused, and an ask that only a
+    // permission rule raised stays core's to settle, which is what that approval is for.
+    const unattendedShellRefusal = (sessionID: string, command: string) =>
+      Effect.gen(function* () {
+        if ((yield* Unattended) === undefined) return undefined
+        const settings = yield* buildSessionSettings(sessionID)
+        const rating = evaluateShellPolicyDecision(settings.policy, command, "allow", configDirs.cwd)
+        if (rating.effect !== "ask") return undefined
+        // Core pauses an automation at once when a failure says the permission "needs approval"; it would otherwise run
+        // the script twice more, up to the refused command each time.
+        return [
+          "ABuCode refuses a shell command in unattended work when the Policy tier would ask about it: it needs approval, and nobody is present to give it.",
+          rating.message,
+        ]
+          .filter(Boolean)
+          .join(" ")
+      })
+
+    yield* ctx.permission.hook("evaluate", (event) =>
+      Effect.gen(function* () {
+        if (event.action !== "shell" || event.effect === "deny") return
+        // Core checks with `*`, and no command or tool call, that a script may use the shell tool at all
+        // (AutomationCode.run, AutomationCode.authorize). The commands it runs are rated when it runs them.
+        const capability = event.resources.length === 1 && event.resources[0] === "*"
+        if (capability && event.source === undefined && event.metadata?.command === undefined) return
+        const refusal = yield* unattendedShellRefusal(event.sessionID, event.resources.join("\n"))
+        if (refusal === undefined) return
+        event.effect = "deny"
+        event.message = refusal
+      }),
+    )
+
+    // The shell tool reports a refused permission as "Unable to execute command", so a script would not learn why. This
+    // hook sees the command whole, before the tool starts, and its failure reaches the script as written.
+    yield* ctx.tool.hook("execute.before", (event) =>
+      Effect.gen(function* () {
+        if (event.tool !== "shell" || typeof event.input !== "object" || event.input === null) return
+        if (!("command" in event.input) || typeof event.input.command !== "string") return
+        const refusal = yield* unattendedShellRefusal(event.sessionID, event.input.command)
+        if (refusal !== undefined) return yield* Effect.fail(new Tool.Error({ message: refusal }))
+      }),
+    )
+
     // The file tools (write, edit, patch, Code Mode's Bun.write, image and video output) ask for `edit` on their target,
     // and so does the shell check above, so this sees them. It asks even where permission rules allow the edit, and it
     // cannot tell a saved "always" from those rules, so it asks each time.
@@ -683,9 +826,11 @@ export default define({
         const files =
           config.length > 3 ? `${config.slice(0, 3).join(", ")} and ${config.length - 3} more` : config.join(", ")
         // In unattended work core settles an ask from the rules and the work's own grant, which would allow this edit.
+        // Core pauses an automation at once when a failure says it "needs approval", instead of running it twice more.
+        // That holds for the shell tool and Code Mode's Bun.write; the file tools replace the text with their own.
         if ((yield* Unattended) !== undefined) {
           event.effect = "deny"
-          event.message = `ABuCode refuses edits to engine config in unattended work, where nobody can approve them: ${files}`
+          event.message = `ABuCode refuses edits to engine config in unattended work: the edit needs approval, and nobody is present to give it: ${files}`
           return
         }
         event.effect = "ask"
