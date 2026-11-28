@@ -12,6 +12,7 @@ import { Config } from "../../config.js"
 import { Watcher } from "../../filesystem/watcher.js"
 import { Location } from "../../location.js"
 import { PluginSourceDirectory } from "../../plugin/source-directory.js"
+import { ConfigTrust } from "../trust.js"
 import { ConfigEntryObserver } from "./entry-observer.js"
 
 export type Operation =
@@ -128,7 +129,10 @@ const scan = Effect.fn("ConfigPluginSource.scan")(function* (
   entries: readonly Entry[],
 ) {
   const discovered = yield* Effect.forEach(
-    entries.filter((entry): entry is Directory => entry.type === "directory"),
+    // ABuCode: the plugin folders of a repository that is not trusted are not read.
+    entries.filter(
+      (entry): entry is Directory => entry.type === "directory" && !(entry instanceof ConfigTrust.Directory),
+    ),
     (entry) =>
       PluginSourceDirectory.discover(fs, entry.path).pipe(
         Effect.map((targets) => targets.map((target): Operation => ({ type: "add", target, options: {} }))),
@@ -140,9 +144,11 @@ const scan = Effect.fn("ConfigPluginSource.scan")(function* (
       (entry.info.plugins ?? []).map(parse).map((operation) => {
         if (operation.type === "remove") return operation
         const directory = entry.path ? path.dirname(entry.path) : location.directory
+        // ABuCode: an absolute path is normalized too, so a `plugin.use` policy that allows a folder sees where the
+        // path leads, not a spelling that starts in that folder and leaves it through `..`.
         const target = operation.target.startsWith("file://")
           ? fileURLToPath(operation.target)
-          : operation.target.startsWith("./") || operation.target.startsWith("../")
+          : operation.target.startsWith("./") || operation.target.startsWith("../") || path.isAbsolute(operation.target)
             ? path.resolve(directory, operation.target)
             : operation.target
         return { ...operation, target }

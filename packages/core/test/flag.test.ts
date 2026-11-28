@@ -26,12 +26,14 @@ const document = (experimental?: ConstructorParameters<typeof ConfigExperimental
     info: new Info(experimental === undefined ? {} : { experimental: new ConfigExperimental.Info(experimental) }),
   })
 
-// todo and opencode_api are opt-in only, so the build defaults and both wildcards leave them off.
+// todo, opencode_api and project_trust are opt-in only, so the build defaults and both wildcards leave them off.
 const every = (state: Flag.State): Record<Flag.Key, Flag.State> => ({
   ...Record.map(ConfigFlag.registry, () => state),
   todo: { enabled: false, source: "default" },
   opencode_api: { enabled: false, source: "default" },
+  project_trust: { enabled: false, source: "default" },
 })
+const optIn = ["todo", "project_trust"] as const
 
 describe("Flag.resolve", () => {
   test.each([
@@ -45,7 +47,7 @@ describe("Flag.resolve", () => {
     expect(Flag.resolve({ entries: [], channel })).toEqual(every({ enabled, source: "default" }))
   })
 
-  test.each(["todo"] as const)("%s is opt-in only: on only when named in OPENCODE_FLAGS or experimental.%s", (key) => {
+  test.each(optIn)("%s is opt-in only: on only when named in OPENCODE_FLAGS or experimental.%s", (key) => {
     expect(Flag.resolve({ entries: [], channel: "dev", overrides: "all" })[key]).toEqual({
       enabled: false,
       source: "default",

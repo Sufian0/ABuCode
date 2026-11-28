@@ -13,6 +13,7 @@ import { Formatter } from "../../formatter.js"
 import { make, type Info } from "../../formatter/builtins.js"
 import { Location } from "../../location.js"
 import { ConfigEntryObserver } from "./entry-observer.js"
+import { ConfigTrust } from "../trust.js"
 
 export const Plugin = define({
   id: "opencode.config.formatter",
@@ -27,6 +28,9 @@ export const Plugin = define({
     const loaded = yield* ConfigEntryObserver.observe(config, ctx.event, formatter.reload())
 
     yield* formatter.transform((editor) => {
+      // ABuCode: no formatter runs in a project that is not trusted. Built-ins run the repository's own tools and
+      // config files (`./vendor/bin/pint`, a prettier config written in JavaScript), and your own can load them too.
+      if (ConfigTrust.untrusted(loaded.entries)) return
       const configured = resolve(loaded.entries)
       if (!configured) return
       const builtIns = make({

@@ -115,6 +115,7 @@ import { IdentityPlugin } from "./identity.js"
 import { ForkNoticePlugin } from "./fork-notice.js"
 import { HomeMemoryPlugin } from "./home-memory.js"
 import { PlanPlugin } from "./plan.js"
+import { ProjectTrustPlugin } from "./project-trust.js"
 import { GoalPlugin } from "./goal.js"
 import { ModelsDevPlugin } from "./models-dev.js"
 import { McpCodeModeDefaultsPlugin } from "./mcp-codemode-defaults.js"
@@ -314,9 +315,14 @@ const post = [
   ConfigInstructionPlugin.Plugin,
   ConfigReferencePlugin.Plugin,
   ConfigAgentPlugin.Plugin,
+  // ABuCode: config commands register before the fork's plugin. A later command with the same name replaces an earlier
+  // one, so a repository's command file cannot answer in place of /policy or the fork's other commands. This plugin
+  // registers nothing but commands, so no other hook or transform changes order.
+  ConfigCommandPlugin.Plugin,
   ABuCodePlugin,
   BrowserPlugin,
-  ConfigCommandPlugin.Plugin,
+  // ABuCode: /trust, after config commands so a repository's command file cannot take its name.
+  ProjectTrustPlugin.Plugin,
   ConfigCompactionPlugin.Plugin,
   ConfigFormatterPlugin.Plugin,
   ConfigImagePlugin.Plugin,
@@ -336,8 +342,13 @@ const post = [
 
 // Repository config must not switch off policy enforcement or the Console connection that delivers
 // organization statements, so plugin remove operations skip these IDs.
-// ABuCode: nor the fork's own plugin, which enforces the policy tiers and the secret-file and network guards.
-export const guarded: ReadonlySet<string> = new Set([OpencodePlugin.id, ConfigPolicyPlugin.Plugin.id, ABuCodePlugin.id])
+// ABuCode: nor the fork's own plugin, which enforces the policy tiers and the secret-file and network guards, nor /trust.
+export const guarded: ReadonlySet<string> = new Set([
+  OpencodePlugin.id,
+  ConfigPolicyPlugin.Plugin.id,
+  ABuCodePlugin.id,
+  ProjectTrustPlugin.Plugin.id,
+])
 
 export const list = Effect.fn("PluginInternal.list")(function* () {
   // Capture only services; activation supplies the child Scope and batching context.

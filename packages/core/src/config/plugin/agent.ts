@@ -9,6 +9,7 @@ import { Agent } from "../../agent.js"
 import { Config } from "../../config.js"
 import { ConfigMarkdown } from "../markdown.js"
 import { ConfigEntryObserver } from "./entry-observer.js"
+import { ConfigTrust } from "../trust.js"
 import { FSUtil } from "@opencode/util/fs-util"
 import { ConfigAgentV1 } from "../../v1/config/agent.js"
 import { ConfigMigrateV1 } from "../../v1/config/migrate.js"
@@ -43,9 +44,17 @@ export const Plugin = define({
       if (entry.type === "document") return [entry]
       if (entry.type !== "directory") return []
       const files = yield* discover(fs, entry.path)
+      // ABuCode: an agent file of a repository that is not trusted keeps what ConfigTrust.restrict keeps of an agent,
+      // so not its permission rules.
+      const restricted = entry instanceof ConfigTrust.Directory
       return yield* Effect.forEach(files, (file) =>
         fs.readFileStringSafe(file.filepath).pipe(
           Effect.flatMap((content) => (content ? decode(file, content) : Effect.succeed(undefined))),
+          Effect.map((document) =>
+            document && restricted
+              ? new Document({ ...document, info: ConfigTrust.restrict(document.info) })
+              : document,
+          ),
           Effect.orElseSucceed(() => undefined),
         ),
       ).pipe(Effect.map((documents) => documents.filter((document): document is Document => document !== undefined)))

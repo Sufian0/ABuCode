@@ -5,10 +5,19 @@ import { isMissingPath, localProjectDirectory, projectConfigDirectories } from "
 
 export { localSource }
 
-export async function localPluginDirectories(cwd: string, configDirectory: string) {
+// ABuCode: `untrusted` tells which project folders' plugins stay unloaded (project trust); it is required, so a caller
+// that drops it fails the type check.
+export async function localPluginDirectories(
+  cwd: string,
+  configDirectory: string,
+  untrusted: (folder: string) => boolean,
+) {
   const projectDirectory = await localProjectDirectory(cwd)
   const projectConfig = path.join(projectDirectory, ".opencode")
-  const directories = [configDirectory, ...projectConfigDirectories(projectDirectory, cwd)]
+  const directories = [
+    configDirectory,
+    ...projectConfigDirectories(projectDirectory, cwd).filter((directory) => !untrusted(path.dirname(directory))),
+  ]
   const exists = await Promise.all(
     directories.map(async (directory) => {
       if (directory === configDirectory || directory === projectConfig) return true

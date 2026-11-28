@@ -100,6 +100,7 @@ import { newSessionLocation } from "./config/new-session-location"
 import { UpdateNotificationProvider, useUpdateNotification, type UpdateSource } from "./context/update-notification"
 import { PluginProvider, usePlugin, type PackageSource } from "./plugin/context"
 import { localPluginDirectories } from "./plugin/discovery"
+import { untrustedFolders } from "./plugin/project-trust"
 import { PluginRoute, Slot } from "./plugin/render"
 import { CommandPaletteDialog } from "./component/command-palette"
 import { COMMAND_PALETTE_COMMAND, Keymap, type KeymapCommand } from "./context/keymap"
@@ -229,7 +230,14 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
     Effect.catch(() => Effect.tryPromise(() => api.location.get())),
   )
   const directory = location.directory
-  const pluginDirectories = yield* Effect.promise(() => localPluginDirectories(process.cwd(), global.config))
+  // ABuCode: project trust holds back the same project plugin folders the engine does.
+  const untrusted = yield* Effect.promise(async () =>
+    untrustedFolders({
+      configDirectory: global.config,
+      entries: await api.config.get({ location: { directory } }).catch(() => undefined),
+    }),
+  )
+  const pluginDirectories = yield* Effect.promise(() => localPluginDirectories(process.cwd(), global.config, untrusted))
   const handoff = input.terminalHandoff ? yield* Effect.promise(input.terminalHandoff) : undefined
   const managed = input.server.service
   const service = managed

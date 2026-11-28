@@ -24,10 +24,12 @@ export const registry = {
     'Let Code Mode scripts call the OpenCode HTTP API with fetch("opencode:///api/..."), in-process and already signed in, with no permission checks. Only in local and dev builds, and off there until you opt in with OPENCODE_FLAGS=opencode_api or experimental.opencode_api: true.',
   sqlite_fts:
     "Build an SQLite full-text index of session titles and message text in the background, and enable the opencode.session.search and opencode.session.read tools. The index covers every session in the database and starts while any loaded location enables it; SQLite keeps it current from then on, also after this is turned off.",
+  project_trust:
+    "ABuCode: hold back what a repository's own config would run (plugins, MCP servers, commands, formatters, the shell, providers, permission rules and other settings) until its folder is listed in trusted-projects.json in the global config folder, which /trust edits. Its instructions, agents and skills still apply. Read only from your own config, never a repository's. Off by default in every build; opt in with OPENCODE_FLAGS=project_trust or experimental.project_trust: true.",
 } as const satisfies Record<string, string>
 export type Key = keyof typeof registry
 
-export const optInOnly: ReadonlySet<Key> = new Set(["todo", "opencode_api"])
+export const optInOnly: ReadonlySet<Key> = new Set(["todo", "opencode_api", "project_trust"])
 
 /** Flags that stay off outside local and dev builds, whatever `OPENCODE_FLAGS` or config say. */
 export const localOnly: ReadonlySet<Key> = new Set(["opencode_api"])
