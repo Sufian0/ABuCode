@@ -201,14 +201,15 @@ const processEffect = Effect.fnUntraced(function* (options: Options) {
             ? `127.0.0.1:${server.address.port}`
             : NetAddress.formatInet(server.address)
         yield* Effect.forkScoped(
-          // ABuCode: also close the tunnel when remote access is turned off by a command that stopped another engine.
+          // ABuCode: also close the tunnel when remote access is turned off, or the password replaced, by a command that
+          // stopped another engine.
           RemoteTunnel.run({
             route: config.remote.route,
             target,
             onURL: (url) => {
               remote.urls = url === undefined ? [] : [url]
             },
-          }).pipe(Effect.raceFirst(ServiceConfig.remoteTurnedOff(config.remote.route))),
+          }).pipe(Effect.raceFirst(ServiceConfig.remoteRevoked({ route: config.remote.route, password }))),
         )
       }
       const url = HttpServer.formatAddress(server.address)

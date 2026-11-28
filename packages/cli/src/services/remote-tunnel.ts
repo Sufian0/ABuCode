@@ -12,7 +12,7 @@ import { EOL } from "os"
 // Holds the route for the life of the service. The SDK reconnects through network failures itself, so only
 // setup failures reach the retry here; a rejected token, failed certificate or unusable proxy (such as a
 // socks5:// `HTTPS_PROXY`, which the bridge cannot connect through) stops it for good.
-// ABuCode: server-process.ts also ends it once the saved settings stop naming the route (ServiceConfig.remoteTurnedOff).
+// ABuCode: server-process.ts also ends it once the saved route or password changes (ServiceConfig.remoteRevoked).
 export const run = Effect.fnUntraced(function* (input: {
   readonly route: string
   readonly target: string
