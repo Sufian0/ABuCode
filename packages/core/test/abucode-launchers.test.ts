@@ -33,7 +33,12 @@ test.each([
 // fails, and can never reach the real `bun` and start an engine.
 test.each([
   "packages/cli/bin/abucode.cjs",
-  ...(process.platform === "win32" ? ["abucode.cmd", "abucode_desktop.cmd"] : ["abucode.sh", "abucode_desktop.sh"]),
+  ...(process.platform === "win32"
+    ? ["abucode.cmd", "abucode_desktop.cmd"]
+    : // Their `#!` line needs bash. Like tool-shell.test.ts, leave them out where it is missing.
+      Bun.which("bash")
+      ? ["abucode.sh", "abucode_desktop.sh"]
+      : []),
 ])("%s hands the engine its list, then the flags the caller named", async (launcher) => {
   await using dir = await tmpdir()
   await Bun.write(path.join(dir.path, "bun.cmd"), "@echo %OPENCODE_FLAGS%\r\n")
@@ -57,10 +62,13 @@ test.each([
           // A relative launcher path keeps cmd.exe's quoting rules out of it, wherever the checkout lives.
           cwd: root,
           env: {
-            // BASH_ENV and ENV name a file a shell reads as it starts, which could put another folder on PATH.
-            ...Object.fromEntries(
-              Object.entries(process.env).filter(([key]) => !/^(path|opencode_flags|bash_env|env)$/i.test(key)),
-            ),
+            // A shell launcher gets nothing from this process's environment: bash runs code that some variables name or
+            // hold as it starts (BASH_ENV, exported functions), and that code could put another folder first on PATH.
+            ...(launcher.endsWith(".sh")
+              ? {}
+              : Object.fromEntries(
+                  Object.entries(process.env).filter(([key]) => !/^(path|opencode_flags)$/i.test(key)),
+                )),
             ...(flags === undefined ? {} : { OPENCODE_FLAGS: flags }),
             PATH: dir.path,
             // abucode.cjs starts this binary instead of looking for `bun`.
