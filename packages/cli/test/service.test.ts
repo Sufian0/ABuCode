@@ -4,7 +4,7 @@ import { Service, type Info } from "@opencode/client/effect/service"
 import { Global } from "@opencode/util/global"
 import { OPENCODE_VERSION } from "../src/version"
 import { expect, test } from "bun:test"
-import { Deferred, Effect, FileSystem, Schedule, Schema } from "effect"
+import { Deferred, Effect, FileSystem, Option, Schedule, Schema } from "effect"
 import { NetAddress } from "effect/net"
 import { TestClock } from "effect/testing"
 import fs from "node:fs/promises"
@@ -169,6 +169,71 @@ test("reading a config with remote access stored as a boolean repairs it in plac
     await fs.rm(root, { recursive: true, force: true })
   }
 })
+
+// An engine closes its tunnel when this watch ends, also when `service set remote false` stopped a different engine.
+it.effect("the remote access watch keeps checking through unrelated changes and ends once remote access is off", () =>
+  Effect.gen(function* () {
+    const watch = yield* watchedRemote()
+    // Twelve checks over twelve hours, with another setting saved halfway: a watch that ends on any change, or that gives
+    // up within twelve checks or twelve hours, fails here.
+    for (const _ of Array.from({ length: 6 })) yield* watch.step
+    yield* watch.save(ServiceConfig.set("hostname", "127.0.0.2"))
+    for (const _ of Array.from({ length: 6 })) yield* watch.step
+    expect(yield* Deferred.isDone(watch.ended)).toBe(false)
+    yield* watch.save(ServiceConfig.set("remote", "false"))
+    yield* watch.ends
+  }),
+)
+
+// Turning remote access off and on again between two checks saves a new route, and the old one must still close.
+it.effect("the remote access watch ends once its route is replaced", () =>
+  Effect.gen(function* () {
+    const watch = yield* watchedRemote()
+    yield* watch.save(ServiceConfig.set("remote", "false").pipe(Effect.andThen(ServiceConfig.remote())))
+    yield* watch.ends
+  }),
+)
+
+// The engine keeps accepting the password it started with, so its tunnel must not outlive a replaced or removed one.
+it.effect("the remote access watch ends once the saved password is replaced", () =>
+  Effect.gen(function* () {
+    const watch = yield* watchedRemote()
+    yield* watch.save(ServiceConfig.set("password", "replaced"))
+    yield* watch.ends
+  }),
+)
+
+it.effect("the remote access watch ends once the saved password is removed", () =>
+  Effect.gen(function* () {
+    const watch = yield* watchedRemote()
+    yield* watch.save(ServiceConfig.unset("password"))
+    yield* watch.ends
+  }),
+)
+
+it.effect("the remote access watch ends once the service settings file is removed", () =>
+  Effect.gen(function* () {
+    const watch = yield* watchedRemote()
+    yield* watch.fileSystem.remove(watch.file)
+    yield* watch.ends
+  }),
+)
+
+// An engine reads its settings before it starts the watch, so a change in between must be caught by the first check.
+// The password has the length of a generated one, so comparing lengths would not do.
+it.effect("the remote access watch ends at its first check if the saved password is not the engine's", () =>
+  Effect.gen(function* () {
+    const watch = yield* watchedRemote({ password: "x".repeat(43) })
+    yield* watch.endsAtFirstCheck
+  }),
+)
+
+it.effect("the remote access watch ends at its first check if the saved route is not the engine's", () =>
+  Effect.gen(function* () {
+    const watch = yield* watchedRemote({ route: "fedcba9876543210" })
+    yield* watch.endsAtFirstCheck
+  }),
+)
 
 test("local channel stores service config with the local service filename", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-service-"))
@@ -875,6 +940,58 @@ const registered = Effect.fnUntraced(function* () {
     return yield* Effect.fail(new Error("The registration watch never shut the server down"))
   })
   return { fileSystem, file, stops, cleanup }
+})
+
+/**
+ * A remote access watch on a newly saved route and password, or on the given ones in their place. `save` changes the
+ * settings, `step` moves the test clock past one check, and `ends` fails unless the watch notices a change within about
+ * ten seconds of test time. `endsAtFirstCheck` waits for the end without moving the clock, so in a test that has not
+ * moved it either, only the first check can have ended the watch.
+ */
+const watchedRemote = Effect.fnUntraced(function* (
+  engine: { readonly route?: string; readonly password?: string } = {},
+) {
+  const fileSystem = yield* FileSystem.FileSystem
+  const root = yield* fileSystem.makeTempDirectoryScoped()
+  const layer = Global.layerWith({ config: path.join(root, "config"), state: path.join(root, "state") })
+  // On the live clock, so that a rename that fails once, as one can on Windows, is retried 10 ms later instead of
+  // waiting for a test clock move that never comes.
+  const save = <A, E>(effect: Effect.Effect<A, E, Global.Service | FileSystem.FileSystem>) =>
+    TestClock.withLive(effect.pipe(Effect.provide(layer)))
+  const password = yield* save(ServiceConfig.password())
+  const route = yield* save(ServiceConfig.remote())
+  const ended = yield* Deferred.make<void>()
+  yield* ServiceConfig.remoteRevoked({ route: engine.route ?? route, password: engine.password ?? password }).pipe(
+    Effect.andThen(Deferred.succeed(ended, undefined)),
+    Effect.provide(layer),
+    Effect.forkScoped,
+  )
+  // Let the watch's immediate first check run, so that a later change is found by a scheduled check.
+  yield* TestClock.withLive(Effect.sleep("50 millis"))
+  const endsAtFirstCheck = TestClock.withLive(Deferred.await(ended).pipe(Effect.timeout("5 seconds")))
+  // Each check reads the file for real and only then schedules the next one, timed from the clock at that moment. So
+  // moving the clock an hour passes one check, given that its read finishes within the live wait after it.
+  const step = TestClock.adjust("1 hour").pipe(Effect.andThen(TestClock.withLive(Effect.sleep("50 millis"))))
+  // The next check is due within 5 seconds. A second 5 second move allows for a read of the old file that was still
+  // running, so a watch that takes longer than about ten seconds fails, on live deadlines rather than a hang. Nothing
+  // here limits how often the watch reads.
+  const ends = Effect.gen(function* () {
+    for (const _ of Array.from({ length: 2 })) {
+      yield* TestClock.adjust("5 seconds")
+      if (Option.isSome(yield* TestClock.withLive(Deferred.await(ended).pipe(Effect.timeoutOption("5 seconds")))))
+        return
+    }
+    return yield* Effect.fail(new Error("The remote access watch did not notice the change in time"))
+  })
+  return {
+    fileSystem,
+    file: path.join(root, "config", ServiceConfig.filename()),
+    ended,
+    save,
+    step,
+    ends,
+    endsAtFirstCheck,
+  }
 })
 
 function serviceEnv(root: string) {
