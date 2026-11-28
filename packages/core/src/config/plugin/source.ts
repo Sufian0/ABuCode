@@ -12,6 +12,7 @@ import { Config } from "../../config.js"
 import { Watcher } from "../../filesystem/watcher.js"
 import { Location } from "../../location.js"
 import { PluginSourceDirectory } from "../../plugin/source-directory.js"
+import { ConfigTrust } from "../trust.js"
 import { ConfigEntryObserver } from "./entry-observer.js"
 
 export type Operation =
@@ -128,7 +129,10 @@ const scan = Effect.fn("ConfigPluginSource.scan")(function* (
   entries: readonly Entry[],
 ) {
   const discovered = yield* Effect.forEach(
-    entries.filter((entry): entry is Directory => entry.type === "directory"),
+    // ABuCode: the plugin folders of a repository that is not trusted are not read.
+    entries.filter(
+      (entry): entry is Directory => entry.type === "directory" && !(entry instanceof ConfigTrust.Directory),
+    ),
     (entry) =>
       PluginSourceDirectory.discover(fs, entry.path).pipe(
         Effect.map((targets) => targets.map((target): Operation => ({ type: "add", target, options: {} }))),

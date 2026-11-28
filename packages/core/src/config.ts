@@ -21,6 +21,7 @@ import { ConfigDiscovery } from "./config/discovery.js"
 import { ConfigWatch } from "./config/watch.js"
 import { ConfigIntegration } from "./config/integration.js"
 import { ConfigManaged } from "./config/managed.js"
+import { ConfigTrust } from "./config/trust.js"
 import { ManagedPolicy } from "./managed-policy.js"
 import { Connection } from "@opencode/schema/connection"
 import { WellKnown } from "./wellknown.js"
@@ -174,13 +175,23 @@ export const layer = (options?: Options) =>
         })
       })
 
-      const loadFile = Effect.fnUntraced(function* (filepath: string, references: Set<string>) {
+      const loadFile = Effect.fnUntraced(function* (filepath: string, references: Set<string>, restricted = false) {
         const text = yield* fs.readFileStringSafe(filepath)
         if (text === undefined) return
         references.add(filepath)
-        const substituted = yield* ConfigVariable.substitute({ type: "path", path: filepath, text, references })
+        // ABuCode: a held-back repository file gets no {env:} or {file:} substitution, which could put a secret into
+        // a URL the engine contacts.
+        const substituted = restricted
+          ? text
+          : yield* ConfigVariable.substitute({ type: "path", path: filepath, text, references })
         const info = yield* parseInfo(substituted, filepath)
         if (!info) return
+        if (restricted)
+          return new ConfigTrust.Document({
+            type: "document",
+            path: AbsolutePath.make(filepath),
+            info: ConfigTrust.restrict(info),
+          })
         return new Document({ type: "document", path: AbsolutePath.make(filepath), info })
       })
 
@@ -278,22 +289,23 @@ export const layer = (options?: Options) =>
         return info ? [new Document({ type: "document", path: plist, info })] : []
       })
 
-      const loadDirectory = Effect.fnUntraced(function* (directory: AbsolutePath, references: Set<string>) {
+      const loadDirectory = Effect.fnUntraced(function* (
+        directory: AbsolutePath,
+        references: Set<string>,
+        restricted = false,
+      ) {
         return [
           ...(yield* Effect.forEach(ConfigDiscovery.names, (file) =>
-            loadFile(path.join(directory, file), references),
+            loadFile(path.join(directory, file), references, restricted),
           ).pipe(Effect.map((configs) => configs.filter((config): config is Document => config !== undefined)))),
-          new Directory({ type: "directory", path: directory }),
+          restricted
+            ? new ConfigTrust.Directory({ type: "directory", path: directory })
+            : new Directory({ type: "directory", path: directory }),
         ]
       })
 
       const load = Effect.fn("Config.load")(function* (sources: ConfigDiscovery.Sources) {
         const references = new Set<string>()
-        const direct = yield* Effect.forEach(sources.direct, (filepath) => loadFile(filepath, references)).pipe(
-          Effect.orDie,
-          Effect.map((entries) => entries.filter((entry): entry is Document => entry !== undefined)),
-        )
-
         const explicit = sources.explicit
           ? yield* loadFile(sources.explicit, references).pipe(
               Effect.map((config) => (config ? [config] : [])),
@@ -347,13 +359,6 @@ export const layer = (options?: Options) =>
         const globalSupplementary = sources.global
           ? yield* loadDirectory(sources.global, references).pipe(Effect.orDie)
           : []
-        const projectSupplementary = yield* Effect.forEach(
-          sources.project.filter((root) => root.present),
-          (root) => loadDirectory(root.path, references),
-        ).pipe(
-          Effect.orDie,
-          Effect.map((entries) => entries.flat()),
-        )
         const lockdown = ManagedPolicy.statements(managedPolicies)
         const integrated = yield* Effect.forEach(integrations.values(), (document) =>
           supplies(lockdown, document.integrationID, document.connection).pipe(
@@ -379,6 +384,39 @@ export const layer = (options?: Options) =>
             ),
           ),
         )
+        // ABuCode: project trust holds back the repository's own files, the ones found by walking up from the
+        // location, until their folder is trusted. Only the documents loaded above, which a repository cannot write,
+        // can turn it on.
+        const roots = sources.project.filter((root) => root.present)
+        const trust = yield* ConfigTrust.decide({
+          owner: [
+            ...managedPolicies,
+            ...integrated,
+            ...wellknownDocuments.flat(),
+            ...globalSupplementary,
+            ...explicit,
+            ...content,
+            ...managedSettings,
+          ],
+          global: sources.global,
+          channel: app.channel,
+          overrides,
+          references,
+          location: location.directory,
+          directories: [...sources.direct, ...roots.map((root) => root.path)].map((item) => path.dirname(item)),
+        })
+        const direct = yield* Effect.forEach(sources.direct, (filepath) =>
+          loadFile(filepath, references, trust.held.has(path.dirname(filepath))),
+        ).pipe(
+          Effect.orDie,
+          Effect.map((entries) => entries.filter((entry): entry is Document => entry !== undefined)),
+        )
+        const projectSupplementary = yield* Effect.forEach(roots, (root) =>
+          loadDirectory(root.path, references, trust.held.has(path.dirname(root.path))),
+        ).pipe(
+          Effect.orDie,
+          Effect.map((entries) => entries.flat()),
+        )
         const below = [
           ...managedPolicies,
           ...integrated,
@@ -401,6 +439,7 @@ export const layer = (options?: Options) =>
             ...below,
             ...(overlay?.present ? yield* loadDirectory(overlay.path, references).pipe(Effect.orDie) : []),
             ...above,
+            ...(trust.state ? [trust.state] : []),
           ],
           sources: effective,
           isInput: yield* ConfigWatch.inputs(effective, references),

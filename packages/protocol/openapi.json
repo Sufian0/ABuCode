@@ -17677,6 +17677,9 @@
               "sqlite_fts": {
                 "type": "boolean"
               },
+              "project_trust": {
+                "type": "boolean"
+              },
               "video_generate": {
                 "anyOf": [
                   {

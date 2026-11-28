@@ -2672,6 +2672,7 @@ export type ConfigEntry =
           project_overlay?: boolean
           opencode_api?: boolean
           sqlite_fts?: boolean
+          project_trust?: boolean
           video_generate?: boolean | { model?: string | { providerID: string; model: string; variant?: string } }
           part_rows?: boolean
           image_generate?: boolean | { model?: string | { providerID: string; model: string; variant?: string } }

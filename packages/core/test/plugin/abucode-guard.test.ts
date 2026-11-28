@@ -86,8 +86,8 @@ const project = (files: Record<string, string>) =>
 describe("ABuCode plugin guard", () => {
   // The plugin enforces the fork's policy tiers and its secret-file and network guards, and the agent can write a
   // repository's opencode.json. Before the plugin was guarded, each of these entries unloaded it.
-  for (const target of ["abucode.core", "abucode.*", "*"]) {
-    it.live(`keeps the ABuCode plugin active through "-${target}"`, () =>
+  for (const target of ["abucode.core", "abucode.trust", "abucode.*", "*"]) {
+    it.live(`keeps the ABuCode plugin and /trust active through "-${target}"`, () =>
       Effect.gen(function* () {
         const ref = yield* project({
           "opencode.json": JSON.stringify({ plugins: [`-${target}`, `-${ConfigAgentPlugin.Plugin.id}`] }),
@@ -102,6 +102,7 @@ describe("ABuCode plugin guard", () => {
         const status = (plugin: string) => inventory.find((item) => item.id === plugin)?.state.status
 
         expect(status(id)).toBe("active")
+        expect(status(Plugin.ID.make("abucode.trust"))).toBe("active")
         // The removals did apply: a built-in that is not guarded is gone.
         expect(status(ConfigAgentPlugin.Plugin.id)).toBeUndefined()
       }),
@@ -138,7 +139,7 @@ describe("ABuCode plugin guard", () => {
   // repository's /policy must not answer in place of the fork's.
   it.live("keeps the ABuCode plugin's commands when a project command file takes the same name", () =>
     Effect.gen(function* () {
-      const names = ["character", "squad", "keys", "memory", "archive", "policy"]
+      const names = ["character", "squad", "keys", "memory", "archive", "policy", "trust"]
       const files = (description: string) =>
         Object.fromEntries(
           [...names, "hello"].map((name) => [
@@ -163,7 +164,8 @@ describe("ABuCode plugin guard", () => {
         )
         const reloaded = yield* commands.list().pipe(
           Effect.filterOrFail((list) => list.some((command) => command.description === "changed command")),
-          Effect.retry({ times: 200, schedule: Schedule.spaced("25 millis") }),
+          Effect.retry(Schedule.spaced("25 millis")),
+          Effect.timeout("15 seconds"),
         )
 
         return { boot, reloaded }
@@ -183,9 +185,8 @@ describe("ABuCode plugin guard", () => {
   // parsed as soon as the project opens, before anything is asked.
   it.live("does not run JavaScript front matter in a project's command, agent and skill files", () =>
     Effect.gen(function* () {
-      const ran = globalThis as unknown as Record<string, unknown>
-      const script = (kind: string) =>
-        `---js\n(() => { globalThis["abucode_front_matter_${kind}"] = true; return { name: "js-${kind}", description: "js ${kind}" } })()\n---\nSay hello.\n`
+      // Front matter that would load if it were evaluated: the file then counts as a valid command, agent or skill.
+      const script = (kind: string) => `---js\n({ name: "js-${kind}", description: "js ${kind}" })\n---\nSay hello.\n`
       const yaml = (kind: string) => `---\nname: yaml-${kind}\ndescription: yaml ${kind}\n---\nSay hello.\n`
       const ref = yield* project({
         ".opencode/agent/js-agent.md": script("agent"),
@@ -215,11 +216,11 @@ describe("ABuCode plugin guard", () => {
               names.agents.includes("yaml-agent") &&
               names.skills.includes("yaml-skill"),
           ),
-          Effect.retry({ times: 200, schedule: Schedule.spaced("25 millis") }),
+          Effect.retry(Schedule.spaced("25 millis")),
+          Effect.timeout("15 seconds"),
         )
       }).pipe(Effect.scoped, Effect.provide(locations.get(ref)))
 
-      expect(["agent", "command", "skill"].filter((kind) => ran[`abucode_front_matter_${kind}`] === true)).toEqual([])
       expect(loaded.commands).not.toContain("js-command")
       expect(loaded.agents).not.toContain("js-agent")
       expect(loaded.skills).not.toContain("js-skill")

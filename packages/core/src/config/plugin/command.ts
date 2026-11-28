@@ -16,6 +16,7 @@ import { ShellSelect } from "../../shell/select.js"
 import { FSUtil } from "@opencode/util/fs-util"
 import { ConfigMarkdown } from "../markdown.js"
 import { ConfigEntryObserver } from "./entry-observer.js"
+import { ConfigTrust } from "../trust.js"
 
 const decodeCommand = SchemaParser.decodeUnknownResult(ConfigCommand.Info)
 const formatIssue = SchemaIssue.makeFormatterDefault()
@@ -27,7 +28,8 @@ export const Plugin = define({
     const fs = yield* FSUtil.Service
     const loadEntry = Effect.fnUntraced(function* (entry: Entry) {
       if (entry.type === "document") return [{ commands: entry.info.commands }]
-      if (entry.type !== "directory") return []
+      // ABuCode: the command files of a repository that is not trusted are not read; their snippets run unasked.
+      if (entry.type !== "directory" || entry instanceof ConfigTrust.Directory) return []
       const commands = yield* loadDirectory(fs, entry.path)
       return [{ commands: Object.fromEntries(commands.map((command) => [command.name, command.info])) }]
     })

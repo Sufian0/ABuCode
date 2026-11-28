@@ -64,6 +64,9 @@ export const overlay = Effect.fn("ConfigDiscovery.overlay")(function* (options?:
   const location = yield* Location.Service
   if (options?.global === false || options?.project === false || location.project.id === Project.ID.global) return
   const directory = AbsolutePath.make(path.join(global.config, "project", location.project.id))
+  // ABuCode: a project ID can come from the repository itself (its .git/opencode), so one that leads out of the
+  // overlay folder, as `..` would, gets no overlay: that folder would load as the owner's own config.
+  if (path.dirname(directory) !== path.join(global.config, "project")) return
   return { path: directory, present: yield* fs.isDir(directory) }
 })
 

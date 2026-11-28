@@ -23,7 +23,7 @@ export default Runtime.handler(
     const global = yield* Global.Service
     const info = yield* config.get()
     const discovered = yield* Effect.promise(() =>
-      localPluginDirectories(process.cwd(), global.config).then(discoverPluginTargets),
+      localPluginDirectories(process.cwd(), global.config, () => false).then(discoverPluginTargets),
     )
     const npm = yield* Npm.Service
     const configured = yield* Effect.forEach([...(info.plugins ?? []), ...discovered], (entry) =>
